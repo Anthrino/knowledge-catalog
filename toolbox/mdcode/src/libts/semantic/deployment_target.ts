@@ -107,7 +107,8 @@ export interface AlloyDbTarget {
   project: string;
   location: string;
   cluster: string;
-  // Set only by the legacy instance-based URI.
+  // Set only by the legacy instance-based URI. Otherwise the runtime finds the
+  // cluster's primary instance.
   instance?: string;
   database: string;
   uri: string;
@@ -218,16 +219,30 @@ export function destinationKey(target: string): string {
 /** Why a deployment's target is not accepted in a `deployments:` list. */
 export function deploymentTargetError(
     model: SemanticModel, d: DeploymentSpec): string {
-  const at =
-      `Model '${model.name}': deployment '${d.name}' targets '${d.target}'`;
-  const legacy = d.target.match(LEGACY_ALLOYDB_TARGET);
+  return targetError(
+      `Model '${model.name}': deployment '${d.name}' targets '${d.target}'`,
+      d.target);
+}
+
+/** Why a target in a GOOGLE block's `deploymentTargets` is not accepted. */
+export function googleBlockTargetError(
+    model: SemanticModel, target: string): string {
+  return targetError(
+      `Model '${model.name}': the GOOGLE custom_extension's ` +
+          `'deploymentTargets' lists '${target}'`,
+      target);
+}
+
+// Why `target` is not accepted. `at` says where it is written.
+function targetError(at: string, target: string): string {
+  const legacy = target.match(LEGACY_ALLOYDB_TARGET);
   if (legacy) {
     return `${at}, the instance-based AlloyDB URI, which names no real ` +
         `resource. An AlloyDB database belongs to its cluster; write '${
                clusterUri(legacy)}'.`;
   }
   const form =
-      CATALOG_PREFIXES.find(([prefix]) => d.target.startsWith(prefix))?.[1];
+      CATALOG_PREFIXES.find(([prefix]) => target.startsWith(prefix))?.[1];
   if (form) {
     return `${at}, which is a Knowledge Catalog name. Write the resource URI ` +
         `instead: '${form}'.`;
