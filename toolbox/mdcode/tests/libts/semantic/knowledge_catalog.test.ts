@@ -525,7 +525,7 @@ describe('relationships map to schema-join entry links', () => {
         },
       ],
       relationships: [{
-        name: 'orders-to-customer',
+        name: 'placed',
         source: {entity: 'orders', columns: ['custkey']},
         destination: {entity: 'customer', columns: ['c_key']},
         description: 'each order belongs to a customer',
@@ -541,7 +541,7 @@ describe('relationships map to schema-join entry links', () => {
 
     // Link id is slugged and undirected: two UNSPECIFIED references naming the
     // endpoint entities' entries, typed schema-join.
-    expect(link.name!.endsWith('/entryLinks/m-orders-to-customer')).toBe(true);
+    expect(link.name!.endsWith('/entryLinks/m-placed')).toBe(true);
     // Already-normalized name: no rename, so no normalization warning.
     expect(link.entryLinkType.endsWith('/entryLinkTypes/schema-join'))
         .toBe(true);
@@ -581,7 +581,7 @@ describe('relationships map to schema-join entry links', () => {
         const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
         expect(entryLinks.length).toBe(0);
         expect(warnings.some(
-                   w => w.includes('orders-to-customer') &&
+                   w => w.includes('relationship \'placed\'') &&
                        w.includes('many-to-many')))
             .toBe(true);
       });
@@ -594,7 +594,8 @@ describe('relationships map to schema-join entry links', () => {
     const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
     expect(entryLinks.length).toBe(0);
     expect(warnings.some(
-               w => w.includes('orders-to-customer') && w.includes('ghost')))
+               w => w.includes('relationship \'placed\'') &&
+                   w.includes('ghost')))
         .toBe(true);
   });
 
@@ -610,7 +611,7 @@ describe('relationships map to schema-join entry links', () => {
          const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
          expect(entryLinks.length).toBe(0);
          expect(warnings.some(
-                    w => w.includes('orders-to-customer') &&
+                    w => w.includes('relationship \'placed\'') &&
                         w.includes('no join columns')))
              .toBe(true);
        });
@@ -638,12 +639,12 @@ describe('relationships map to schema-join entry links', () => {
         const model = directFkModel();
         model.relationships = [
           {
-            name: 'billing-customer',
+            name: 'billing',
             source: {entity: 'orders', columns: ['billing_custkey']},
             destination: {entity: 'customer', columns: ['c_key']},
           },
           {
-            name: 'shipping-customer',
+            name: 'shipping',
             source: {entity: 'customer', columns: ['c_key']},
             destination: {entity: 'orders', columns: ['shipping_custkey']},
           },
@@ -653,12 +654,79 @@ describe('relationships map to schema-join entry links', () => {
 
         expect(entryLinks.map(l => l.name)).toEqual([
           'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
-              'm-billing-customer',
+              'm-billing',
         ]);
         expect(warnings).toEqual([
-          'relationship \'shipping-customer\': shares entities \'customer\' ' +
-              'and \'orders\' with relationship \'billing-customer\'; ' +
+          'relationship \'shipping\': shares entities \'customer\' ' +
+              'and \'orders\' with relationship \'billing\'; ' +
               'skipped because the catalog shows one join for those entities.',
+        ]);
+      });
+
+  test(
+      'two relationships that share one entity on different pairs both ' +
+          'emit a link',
+      () => {
+        // `customer` sorts first in both pairs, so a pair key built from one
+        // entity alone would wrongly skip the second relationship.
+        const model = directFkModel();
+        model.entities.push({
+          name: 'supplier',
+          dataSource: 'p.d.supplier',
+          keys: ['s_key'],
+          fields: [],
+        });
+        model.relationships = [
+          {
+            name: 'billing',
+            source: {entity: 'orders', columns: ['custkey']},
+            destination: {entity: 'customer', columns: ['c_key']},
+          },
+          {
+            name: 'sourcing',
+            source: {entity: 'customer', columns: ['suppkey']},
+            destination: {entity: 'supplier', columns: ['s_key']},
+          },
+        ];
+
+        const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
+
+        expect(entryLinks.map(l => l.name)).toEqual([
+          'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/m-billing',
+          'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
+              'm-sourcing',
+        ]);
+        expect(warnings).toEqual([]);
+      });
+
+  test(
+      'a relationship from an entity to itself, flag off, is skipped with ' +
+          'a warning, and a second one gets no shared-pair warning',
+      () => {
+        const model = directFkModel();
+        model.relationships.push(
+            {
+              name: 'referrer',
+              source: {entity: 'customer', columns: ['referred_by']},
+              destination: {entity: 'customer', columns: ['c_key']},
+            },
+            {
+              name: 'parent',
+              source: {entity: 'customer', columns: ['parent_key']},
+              destination: {entity: 'customer', columns: ['c_key']},
+            });
+
+        const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
+
+        expect(entryLinks.map(l => l.name)).toEqual([
+          'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
+              'm-placed',
+        ]);
+        expect(warnings).toEqual([
+          'relationship \'referrer\': skipped because Knowledge Catalog ' +
+              'does not support a relationship from an entity to itself.',
+          'relationship \'parent\': skipped because Knowledge Catalog ' +
+              'does not support a relationship from an entity to itself.',
         ]);
       });
 
@@ -669,7 +737,7 @@ describe('relationships map to schema-join entry links', () => {
         const model = directFkModel();
         model.relationships = [
           {
-            name: 'assoc-orders-customer',
+            name: 'assoc',
             source: {entity: 'orders', columns: ['custkey']},
             destination: {entity: 'customer', columns: ['c_key']},
             association: {
@@ -680,7 +748,7 @@ describe('relationships map to schema-join entry links', () => {
             },
           },
           {
-            name: 'orders-to-customer',
+            name: 'placed',
             source: {entity: 'orders', columns: ['custkey']},
             destination: {entity: 'customer', columns: ['c_key']},
           },
@@ -690,25 +758,127 @@ describe('relationships map to schema-join entry links', () => {
 
         expect(entryLinks.map(l => l.name)).toEqual([
           'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
-              'm-orders-to-customer',
+              'm-placed',
         ]);
         expect(warnings.length).toBe(1);
-        expect(warnings[0]).toContain('assoc-orders-customer');
+        expect(warnings[0]).toContain('relationship \'assoc\'');
       });
 
   test(
-      'two relationships between the same pair of entities emit both ' +
-          'links when v2Aspects is true',
+      'an unpublishable relationship after a valid relationship on the same ' +
+          'entity pair or on a self-relationship warns with its ' +
+          'unpublishable reason',
       () => {
         const model = directFkModel();
         model.relationships = [
           {
-            name: 'billing-customer',
+            name: 'placed',
+            source: {entity: 'orders', columns: ['custkey']},
+            destination: {entity: 'customer', columns: ['c_key']},
+          },
+          {
+            name: 'assoc',
+            source: {entity: 'orders', columns: ['custkey']},
+            destination: {entity: 'customer', columns: ['c_key']},
+            association: {
+              dataSource: 'p.d.order_customer',
+              keys: ['id'],
+              sourceColumns: ['o_key'],
+              destinationColumns: ['c_key'],
+            },
+          },
+          {
+            name: 'self_assoc',
+            source: {entity: 'orders', columns: ['o_key']},
+            destination: {entity: 'orders', columns: ['o_key']},
+            association: {
+              dataSource: 'p.d.order_related',
+              keys: ['id'],
+              sourceColumns: ['o_key'],
+              destinationColumns: ['related_key'],
+            },
+          },
+        ];
+        const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
+        expect(entryLinks.map(l => l.name)).toEqual([
+          'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
+              'm-placed',
+        ]);
+        expect(warnings).toEqual([
+          'relationship \'assoc\': many-to-many (association) edges are not ' +
+              'published to Knowledge Catalog yet; the edge lives in the ' +
+              'BigQuery property graph.',
+          'relationship \'self_assoc\': many-to-many (association) edges are ' +
+              'not published to Knowledge Catalog yet; the edge lives in the ' +
+              'BigQuery property graph.',
+        ]);
+      });
+
+  test(
+      'a column-less relationship after a valid one on the same pair warns ' +
+          'about its join columns, a self relationship on an unpublished ' +
+          'entity warns about that entity, and a column-less self ' +
+          'relationship gets the self warning',
+      () => {
+        // Adding join columns does not publish a relationship from an entity
+        // to itself, so the self warning is the one that applies to it.
+        const model = directFkModel();
+        model.relationships = [
+          {
+            name: 'placed',
+            source: {entity: 'orders', columns: ['custkey']},
+            destination: {entity: 'customer', columns: ['c_key']},
+          },
+          {
+            name: 'logical',
+            source: {entity: 'orders', columns: []},
+            destination: {entity: 'customer', columns: []},
+          },
+          {
+            name: 'ghost_self',
+            source: {entity: 'ghost', columns: ['parent_key']},
+            destination: {entity: 'ghost', columns: ['g_key']},
+          },
+          {
+            name: 'logical_self',
+            source: {entity: 'customer', columns: []},
+            destination: {entity: 'customer', columns: []},
+          },
+        ];
+
+        const {entryLinks, warnings} = generateCatalogResources(model, OPTS);
+
+        expect(entryLinks.map(l => l.name)).toEqual([
+          'projects/dest-proj/locations/us/entryGroups/eg/entryLinks/' +
+              'm-placed',
+        ]);
+        expect(warnings).toEqual([
+          'relationship \'logical\': no join columns, so it is not published ' +
+              'to Knowledge Catalog yet; add its from_columns and to_columns ' +
+              'to the relationship in the model to publish the link.',
+          'relationship \'ghost_self\': endpoint entity \'ghost\' is not a ' +
+              'published entity; the relationship link is skipped.',
+          'relationship \'logical_self\': skipped because Knowledge Catalog ' +
+              'does not support a relationship from an entity to itself.',
+        ]);
+      });
+
+  test(
+      'under v2Aspects, two relationships between the same pair of ' +
+          'entities both emit a link, and Dataplex refuses the second',
+      () => {
+        // The emitter writes `schema-join` links under both layouts, and
+        // Dataplex allows one link of a type between two entries. This pins
+        // today's output until the V2 design settles this case.
+        const model = directFkModel();
+        model.relationships = [
+          {
+            name: 'billing',
             source: {entity: 'orders', columns: ['billing_custkey']},
             destination: {entity: 'customer', columns: ['c_key']},
           },
           {
-            name: 'shipping-customer',
+            name: 'shipping',
             source: {entity: 'orders', columns: ['shipping_custkey']},
             destination: {entity: 'customer', columns: ['c_key']},
           },
@@ -718,6 +888,26 @@ describe('relationships map to schema-join entry links', () => {
             generateCatalogResources(model, {...OPTS, v2Aspects: true});
 
         expect(entryLinks.length).toBe(2);
+        expect(warnings).toEqual([]);
+      });
+
+  test(
+      'under v2Aspects, a relationship from an entity to itself still ' +
+          'emits a link',
+      () => {
+        // Only the flag-off path skips it. Dataplex refuses this
+        // `schema-join` link too, and the V2 design decides this case.
+        const model = directFkModel();
+        model.relationships = [{
+          name: 'referrer',
+          source: {entity: 'customer', columns: ['referred_by']},
+          destination: {entity: 'customer', columns: ['c_key']},
+        }];
+
+        const {entryLinks, warnings} =
+            generateCatalogResources(model, {...OPTS, v2Aspects: true});
+
+        expect(entryLinks.length).toBe(1);
         expect(warnings).toEqual([]);
       });
 });
@@ -748,7 +938,7 @@ describe('a purely logical model (no physical binding) emits cleanly', () => {
         },
       ],
       relationships: [{
-        name: 'orders-to-customer',
+        name: 'placed',
         source: {entity: 'orders', columns: ['custkey']},
         destination: {entity: 'customer', columns: ['c_key']},
       }],
