@@ -9,8 +9,8 @@
 // b/568183888 moves them to the parser.
 //
 
-import {Entity, fieldBinding, keysCoveredBy} from './ir';
-import {SqlColumn, sqlColumns} from './sql_parser';
+import {Entity, Field, fieldBinding, keysCoveredBy} from './ir';
+import {SqlColumn, sqlColumns, withoutComments} from './sql_parser';
 
 // Matches a single- or double-quoted SQL string literal, honoring backslash
 // escapes. (Triple-quoted / raw literals are uncommon in these expressions and
@@ -73,16 +73,41 @@ export function stripQualifier(expression: string, entity: string): string {
   return mapOutsideStringLiterals(expression, seg => seg.replace(re, ''));
 }
 
+// `text`, written in `dialect`, with its comments removed. An ANSI_SQL text, or
+// a text with no dialect, is read as BigQuery, as the loader and the graph
+// generators read it.
+export function sqlWithoutComments(text: string, dialect?: string): string {
+  return withoutComments(
+      text, !dialect || dialect === 'ANSI_SQL' ? 'BIGQUERY' : dialect);
+}
+
+// `field`'s binding, as fieldBinding gives it, with its comments removed.
+// Undefined when the field is unbound. The target text is read in
+// `targetDialect`, BigQuery unless given, which is how the graph generators
+// read it. The parser reads Spanner SQL as BigQuery. Imported vendor SQL, the
+// binding only when there is no target text, is read in its imported dialect,
+// so it keeps what that dialect does not read as a comment.
+export function fieldBindingWithoutComments(
+    field: Pick<Field, 'expression'|'importedExpression'|'importedDialect'>,
+    targetDialect?: string): string|undefined {
+  const text = fieldBinding(field);
+  if (text === undefined) return undefined;
+  return sqlWithoutComments(
+      text,
+      field.expression === undefined ? field.importedDialect : targetDialect);
+}
+
 // The physical column a key or join column names, as the graph generators read
 // it: a name that matches one of the entity's fields is that field's column,
-// and any other name is a column already. Undefined when the name is a field
-// with no column in this binding.
+// read without its comments, and any other name is a column already. Undefined
+// when the name is a field with no column in this binding.
 export function keyColumn(
     entity: Pick<Entity, 'name'|'fields'>, name: string): string|undefined {
   const field = entity.fields.find(f => f.name === name);
   if (!field) return name;
-  const expr = fieldBinding(field);
-  return expr === undefined ? undefined : stripQualifier(expr, entity.name).trim();
+  const expr = fieldBindingWithoutComments(field);
+  return expr === undefined ? undefined :
+                              stripQualifier(expr, entity.name).trim();
 }
 
 // Which keys `toColumns` cover once every name is read as its column (see

@@ -16,6 +16,7 @@ import {resolveInheritance} from '../../../src/libts/semantic/resolve_inheritanc
 import * as sqlUtils from '../../../src/libts/semantic/sql_expr_utils';
 import {applyProfile, applyProfileExclusions, applyProfileFile, loadProfileFile, mergeProfile as mergeProfileImpl, mergeProfileOntoDoc as mergeProfileOntoDocImpl, ProfileExclusion, profileForDocument, pruneUnavailable, sourcesDialect, validateProfileCompleteness, validateProfileConsistency} from '../../../src/libts/semantic/resolve_profiles';
 import {loadSqlEngine} from '../../../src/libts/semantic/sql_parser';
+import {validatePushRequirements} from '../../../src/libts/semantic/validate';
 import {YAML_OPTIONS} from '../../../src/libts/semantic/yaml_options';
 
 beforeAll(async () => {
@@ -2068,6 +2069,439 @@ describe('profile rules', () => {
         .toThrow("field 'a': 'expression': dialects.0: Unrecognized key: \"note\"");
   });
 
+  // A blank expression, one that is only a comment and one that is only its
+  // entity's qualifier are rejected, as in a model file.
+  test('a profile expression may not be blank', () => {
+    const file = (expression: string) =>
+        `name: prod\nentities:\n  - name: o\n    fields:\n      - {name: a, expression: ${expression}}\n`;
+    expect(() => loadProfileFile(file('""'), 'prod'))
+        .toThrow(
+            "profile 'prod': entity 'o': field 'a': 'expression' is blank; " +
+            "write the field's SQL");
+    expect(() => loadProfileFile(
+               file('{dialects: [{dialect: BIGQUERY, expression: "  "}]}'), 'prod'))
+        .toThrow(
+            "profile 'prod': entity 'o': field 'a': the BIGQUERY entry of " +
+            "'expression' is blank; write the field's SQL");
+    expect(() => loadProfileFile(file('"-- todo"'), 'prod'))
+        .toThrow(
+            "profile 'prod': entity 'o': field 'a': 'expression' is only a " +
+            "comment; write the field's SQL");
+    expect(() => loadProfileFile(file('"o."'), 'prod'))
+        .toThrow(
+            "profile 'prod': entity 'o': field 'a': 'expression' is only the " +
+            "qualifier 'o.'; write the field's SQL");
+  });
+
+  // Inheritance removes `base.` on `orders`, and the graph generators remove
+  // `orders.`, so the binding is checked on the entity that inherits it.
+  test('a profile binding may not leave an inheriting entity only its qualifier', () => {
+    const {models} = loadModels(`version: "0.2.0.dev0/google"
+semantic_model:
+  - name: shop
+    entities:
+      - name: base
+        source: //bigquery.googleapis.com/projects/p/datasets/d/tables/base
+        primary_key: [id]
+        fields:
+          - {name: id, expression: id}
+          - {name: notes, expression: notes}
+      - name: orders
+        extends: [base]
+        source: //bigquery.googleapis.com/projects/p/datasets/d/tables/orders
+        primary_key: [id]
+    deployments:
+      - name: default
+        target: //bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/shop
+`);
+    const profile = (expression: string) =>
+        `name: prod\nentities:\n  - name: base\n    fields:\n      - {name: notes, expression: ${expression}}\n`;
+    expect(applyProfileFile(models[0], profile('"base.orders."'), 'prod')).toEqual({
+      error: "profile 'prod': entity 'orders' inherits field 'notes': read on " +
+          "'orders', 'expression' is only the qualifier 'orders.'; write the " +
+          "field's SQL",
+    });
+    expect(applyProfileFile(models[0], profile('"base.notes"'), 'prod'))
+        .not.toHaveProperty('error');
+  });
+
+  test('completeness reports a profile binding that leaves an inheriting entity only its qualifier, as the apply does', () => {
+    const {models} = loadModels(`version: "0.2.0.dev0/google"
+semantic_model:
+  - name: shop
+    entities:
+      - name: base
+        source: //bigquery.googleapis.com/projects/p/datasets/d/tables/base
+        primary_key: [id]
+        fields:
+          - {name: id, expression: id}
+          - {name: notes, expression: notes}
+      - name: orders
+        extends: [base]
+        source: //bigquery.googleapis.com/projects/p/datasets/d/tables/orders
+        primary_key: [id]
+`);
+    const profile = (expression: string) => loadProfileFile(`name: prod
+entities:
+  - name: base
+    source: //bigquery.googleapis.com/projects/p/datasets/prod/tables/base
+    fields:
+      - {name: notes, expression: ${expression}}
+  - name: orders
+    source: //bigquery.googleapis.com/projects/p/datasets/prod/tables/orders
+`, 'prod');
+    expect(validateProfileCompleteness(models[0], profile('"base.orders."')))
+        .toEqual([
+          "profile 'prod': entity 'orders' inherits field 'notes': read on " +
+          "'orders', 'expression' is only the qualifier 'orders.'; write the " +
+          "field's SQL",
+        ]);
+    expect(validateProfileCompleteness(models[0], profile('notes_col')))
+        .toEqual([]);
+    // A binding the reader rejects is reported once, where the profile writes
+    // it, also when a profile built in memory gives it with no dialect list.
+    for (const notes of [
+           {name: 'notes', expression: '-- todo'},
+           {name: 'notes', importedExpression: '-- todo', importedDialect: 'POSTGRES'},
+         ]) {
+      expect(validateProfileCompleteness(models[0], {
+        name: 'prod',
+        relationships: [],
+        entities: [
+          {name: 'base', source: '//bigquery.googleapis.com/projects/p/datasets/prod/tables/base', fields: [notes]},
+          {name: 'orders', source: '//bigquery.googleapis.com/projects/p/datasets/prod/tables/orders'},
+        ],
+      })).toEqual([expect.stringMatching(
+          /^profile 'prod': entity 'base': field 'notes': .* is only a comment; write the field's SQL$/)]);
+    }
+  });
+
+  // A field an entity binds itself is checked where it is declared, so the
+  // inherited check reads only the fields the entity takes from an ancestor.
+  test('the inherited check of the profile checks reads only what an entity inherits, and completeness lists every field', () => {
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    // A model built in memory skips the loader, so `own` holds no SQL.
+    const base: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [
+            {name: 'id', expression: 'id'},
+            {name: 'label', expression: 'label'},
+            {name: 'tag', expression: 'tag'},
+            {name: 'memo', expression: 'memo'},
+            // It holds no SQL where it is declared, which push reports.
+            {name: 'old', expression: '-- old'},
+          ],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [
+            {name: 'id', expression: 'id'},
+            {name: 'own', expression: '-- todo'},
+            {name: 'memo', expression: '/* todo */'},
+            // A line that binds nothing takes the ancestor's binding.
+            {name: 'tag'},
+          ],
+        },
+      ],
+    };
+    const profile = loadProfileFile(`name: prod
+entities:
+  - name: base
+    source: ${BQ('base')}
+    fields:
+      - {name: label, expression: "base.orders."}
+      - {name: tag, expression: "base.orders."}
+  - name: orders
+    source: ${BQ('orders')}
+`, 'prod');
+    const inherited = (field: string) =>
+        `profile 'prod': entity 'orders' inherits field '${field}': read on ` +
+        `'orders', 'expression' is only the qualifier 'orders.'; write the ` +
+        `field's SQL`;
+    // Fields the entity declares come first.
+    expect(() => applyProfile(base, profile)).toThrow(inherited('tag'));
+    expect(validateProfileCompleteness(base, profile))
+        .toEqual([inherited('tag'), inherited('label')]);
+  });
+
+  // A dialect list cannot hold an imported text with no imported dialect, or
+  // one marked BIGQUERY beside a target text. A model built in memory can
+  // also carry an imported text beside its dialect list. Push reads each such
+  // text.
+  test('push reads an inherited imported text outside the dialect list', () => {
+    // Each imported text holds SQL on `base` and is only the qualifier
+    // `orders.` on `orders`.
+    const shop: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [
+            {name: 'id', expression: 'id'},
+            {
+              name: 'loose',
+              expression: 'loose',
+              importedExpression: 'base.orders.',
+            },
+            {
+              name: 'marked',
+              expression: 'marked',
+              importedExpression: 'base.orders.',
+              importedDialect: 'BIGQUERY',
+            },
+            {
+              name: 'listed',
+              dialects: [{dialect: 'BIGQUERY', expression: 'listed'}],
+              expression: 'listed',
+              importedExpression: 'base.orders.',
+              importedDialect: 'POSTGRES',
+            },
+            // Its target text has no SQL where it is declared, which push
+            // reports there.
+            {
+              name: 'todo',
+              expression: '-- todo',
+              importedExpression: 'base.orders.',
+            },
+          ],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+      ],
+    };
+    const problem = (field: string) =>
+        `entity 'orders' inherits field '${field}': read on 'orders', ` +
+        (field === 'todo' ? `'expression' is only a comment and ` : '') +
+        `'importedExpression' is only the qualifier 'orders.'; write the ` +
+        `field's SQL`;
+    const fields = ['loose', 'marked', 'listed', 'todo'];
+    expect(validatePushRequirements(
+               [{document: 'shop.yaml', model: shop}], {targetOptional: true}))
+        .toEqual([
+          "field 'base.todo' in model 'shop' (shop.yaml): 'expression' is " +
+              "only a comment; write the field's SQL, or remove 'expression' " +
+              'to leave the field unbound.',
+          ...fields.map(f => `model 'shop' (shop.yaml): ${problem(f)}.`),
+        ]);
+  });
+
+  // A load dialect other than BigQuery picks the target text from that
+  // dialect's entry. The entry already names the text, so it is not named
+  // again.
+  test('the inherited check names a text once when the load dialect picks it from a dialect entry', () => {
+    const shop: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}, {name: 'note'}],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+      ],
+    };
+    const note = {
+      name: 'note',
+      dialects: [{dialect: 'SPANNER' as const, expression: 'base.orders.'}],
+    };
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    const profile: ProfileSpec = {
+      name: 'prod',
+      relationships: [],
+      entities: [
+        {name: 'base', source: BQ('base'), fields: [note]},
+        {name: 'orders', source: BQ('orders')},
+      ],
+    };
+    const problem = "entity 'orders' inherits field 'note': read on " +
+        "'orders', the SPANNER entry of 'expression' is only the qualifier " +
+        "'orders.'; write the field's SQL";
+    expect(() => applyProfile(shop, profile, {load: {dialect: 'SPANNER'}}))
+        .toThrow(`profile 'prod': ${problem}`);
+    // Push reads the field as a load with the SPANNER dialect gives it.
+    const loaded = structuredClone(shop);
+    loaded.entities[0].fields[1] =
+        {...note, stringForm: false, expression: 'base.orders.'};
+    expect(validatePushRequirements(
+               [{document: 'shop.yaml', model: loaded}],
+               {targetOptional: true}))
+        .toEqual([`model 'shop' (shop.yaml): ${problem}.`]);
+  });
+
+  // In PostgreSQL `#` is an operator, so `base.orders.# pts` holds SQL on
+  // `orders`. A load in that dialect gives the field that text as its target
+  // text, which BigQuery would read as the qualifier `orders.` and a comment.
+  test('the profile checks read an inherited field in its own dialects under any load dialect', () => {
+    const PG = (t: string) =>
+        `cloudsql_postgresql:p.us-central1.inst.db.public.${t}`;
+    const pts = `
+            expression:
+              dialects:
+                - dialect: POSTGRES
+                  expression: "base.orders.# pts"`;
+    const modelText = (bound: boolean) => `version: "0.2.0.dev0/google"
+semantic_model:
+  - name: shop
+    entities:
+      - name: base
+        source: "${PG('base')}"
+        primary_key: [id]
+        fields:
+          - {name: id, expression: id}
+          - name: pts${bound ? pts : ''}
+      - name: orders
+        extends: [base]
+        source: "${PG('orders')}"
+        primary_key: [id]
+        fields:
+          - {name: id, expression: id}
+`;
+    const profileText = `name: prod
+entities:
+  - name: base
+    source: "${PG('base')}"
+    fields:
+      - name: pts${pts.replace(/\n {4}/g, '\n')}
+  - name: orders
+    source: "${PG('orders')}"
+`;
+    const load = (text: string) =>
+        loadSemanticModels(
+            [{name: 'shop.yaml', text}],
+            {dialect: 'POSTGRES', bindingOptional: true});
+    const merged = mergeProfileOntoDocImpl(modelText(false), profileText, 'prod');
+    if ('error' in merged) throw new Error(merged.error);
+    expect(load(merged.text).error).toBeUndefined();
+    const applied = applyProfileFile(
+        load(modelText(false)).models[0].model, profileText, 'prod',
+        {load: {dialect: 'POSTGRES'}});
+    expect('error' in applied ? applied.error : undefined).toBeUndefined();
+    // The model file binds the field, and the profile binds only sources.
+    const bound = load(modelText(true));
+    expect(bound.error).toBeUndefined();
+    const sources: ProfileSpec = {
+      name: 'prod',
+      relationships: [],
+      entities: [
+        {name: 'base', source: PG('base')},
+        {name: 'orders', source: PG('orders')},
+      ],
+    };
+    expect(() => applyProfile(bound.models[0].model, sources)).not.toThrow();
+    expect(validateProfileCompleteness(bound.models[0].model, sources))
+        .toEqual([]);
+  });
+
+  // The warning would say kcmd could not read SQL that is not there.
+  test('the profile checks and pruning give a text with no SQL no unread-SQL warning', () => {
+    const {models} = loadModels(`version: "0.2.0.dev0/google"
+semantic_model:
+  - name: shop
+    entities:
+      - name: orders
+        source: //bigquery.googleapis.com/projects/p/datasets/d/tables/orders
+        primary_key: [id]
+        fields:
+          - {name: id, expression: id}
+          - {name: notes}
+          - {name: memo, expression: memo}
+`);
+    // A profile built in memory skips the profile-file reader.
+    const warnings: string[] = [];
+    expect(validateProfileCompleteness(
+               models[0], {
+                 name: 'prod',
+                 relationships: [],
+                 entities: [{
+                   name: 'orders',
+                   source: '//bigquery.googleapis.com/projects/p/datasets/prod/tables/orders',
+                   fields: [
+                     {name: 'notes', expression: '-- todo'},
+                     {name: 'memo', expression: 'orders.'},
+                   ],
+                 }],
+               },
+               warnings))
+        .toEqual([
+          "profile 'prod': entity 'orders': field 'notes': 'expression' is " +
+              "only a comment; write the field's SQL",
+          "profile 'prod': entity 'orders': field 'memo': 'expression' is " +
+              "only the qualifier 'orders.'; write the field's SQL",
+        ]);
+    expect(warnings).toEqual([]);
+    // A model built in memory skips the loader. `u` is unbound, so pruning
+    // reads what each other field reads.
+    const inMemory: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      entities: [{
+        name: 'orders',
+        dataSource: 'p.d.orders',
+        keys: ['id'],
+        fields: [
+          {name: 'id', expression: 'id'},
+          {name: 'u'},
+          {name: 'memo', expression: '-- todo'},
+        ],
+      }],
+      metrics: [
+        {name: 'total', expression: '/* todo */', entity: 'orders'},
+        {
+          name: 'count',
+          expression: 'COUNT(orders.id)',
+          dialects: [
+            {dialect: 'BIGQUERY', expression: 'COUNT(orders.id)'},
+            {dialect: 'POSTGRES', expression: '-- todo'},
+          ],
+        },
+      ],
+    };
+    expect(pruneUnavailable(inMemory, 'prod').report.warnings).toEqual([]);
+    const modelWarnings: string[] = [];
+    validateProfileCompleteness(
+        inMemory, {
+          name: 'prod',
+          relationships: [],
+          entities: [{
+            name: 'orders',
+            source: '//bigquery.googleapis.com/projects/p/datasets/prod/tables/orders',
+            fieldsExclude: ['u'],
+          }],
+        },
+        modelWarnings);
+    expect(modelWarnings).toEqual([]);
+  });
+
   // An abstract entity has no table, so a profile entry for one is rejected.
   test('the merge rejects an entry for an abstract entity', () => {
     const logical = {semantic_model: [{name: 'm', entities: [
@@ -2909,7 +3343,7 @@ describe('a document mistake versus a bug', () => {
   test('the readers throw a SemanticModelError for a mistake', () => {
     expect(() => loader.parseSource('orders', {}, "entity 'orders'"))
         .toThrow(SemanticModelError);
-    expect(() => loader.parseFieldExpression(7, "field 'a'", 'BIGQUERY'))
+    expect(() => loader.parseFieldExpression(7, "field 'a'", 'BIGQUERY', 'e'))
         .toThrow(SemanticModelError);
     expect(() => loader.parseExecutor({mcp: {}}, "action 'a'"))
         .toThrow(SemanticModelError);
@@ -3543,6 +3977,296 @@ entities:
     expect(validateProfileCompleteness(base, spec({
       entities: [{name: 'account'}, {name: 'account'}],
     }))).toContain("profile 'prod' 'entities' lists 'account' twice");
+    // A binding with no dialect list is read as the string form, so a blank
+    // one is rejected as in a profile file.
+    for (const [expression, reason] of [['  ', 'is blank'], ['-- todo', 'is only a comment']]) {
+      expect(() => applyProfile(base, spec({
+               entities: [{name: 'account', fields: [{name: 'note', expression}]}],
+             })))
+          .toThrow(`profile 'prod': entity 'account': field 'note': 'expression' ${reason}`);
+    }
+    // An imported text with no dialect list is read in its imported dialect,
+    // as the generators read it. PostgreSQL reads `#` as an operator, so
+    // `# path`, which counts a path's points, holds SQL there.
+    const imported = (text: string) => spec({
+      entities: [{
+        name: 'account',
+        fields: [{name: 'note', importedExpression: text, importedDialect: 'POSTGRES'}],
+      }],
+    });
+    expect(() => applyProfile(base, imported('# path'))).not.toThrow();
+    expect(() => applyProfile(base, imported('-- todo')))
+        .toThrow(
+            "profile 'prod': entity 'account': field 'note': the POSTGRES " +
+            "entry of 'expression' is only a comment");
+    // Beside a target text, the imported text is read too, as a profile file
+    // with both entries is.
+    const both = (text: string) => spec({
+      entities: [{
+        name: 'account',
+        fields: [{
+          name: 'note',
+          expression: 'a_note',
+          importedExpression: text,
+          importedDialect: 'POSTGRES',
+        }],
+      }],
+    });
+    expect(() => applyProfile(base, both('# path'))).not.toThrow();
+    const bothProblem = "profile 'prod': entity 'account': field 'note': the " +
+        "POSTGRES entry of 'expression' is only a comment";
+    expect(() => applyProfile(base, both('-- todo'))).toThrow(bothProblem);
+    expect(validateProfileCompleteness(base, both('-- todo')))
+        .toContain(`${bothProblem}; write the field's SQL`);
+    // With no imported dialect, or one a dialect list cannot hold beside the
+    // target text, the imported text is read as push reads it, also when the
+    // target text has no SQL.
+    for (const importedDialect of [undefined, 'BIGQUERY']) {
+      for (const [expression, target] of [
+             ['a_note', ''],
+             ['/* todo */', "'expression' is only a comment and "],
+           ]) {
+        const odd = spec({
+          entities: [{
+            name: 'account',
+            fields: [{
+              name: 'note',
+              expression,
+              importedExpression: '-- todo',
+              ...(importedDialect ? {importedDialect} : {}),
+            }],
+          }],
+        });
+        const problem = "profile 'prod': entity 'account': field 'note': " +
+            `${target}'importedExpression' is only a comment; write the ` +
+            "field's SQL";
+        expect(() => applyProfile(base, odd)).toThrow(problem);
+        expect(validateProfileCompleteness(base, odd)
+                   .filter(e => e.includes("field 'note'")))
+            .toEqual([problem]);
+      }
+    }
+  });
+
+  // A profile file with such a binding does not load, so only a profile
+  // built in memory reaches completeness with it.
+  test('completeness reports a rejected binding on an ancestor once, and not again on each entity that inherits it', () => {
+    const shop = (abstract: boolean): SemanticModel => ({
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: abstract ? '' : 'p.d.base',
+          ...(abstract ? {abstract} : {}),
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}, {name: 'note'}],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+      ],
+    });
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    const profile = (note: Partial<Field>): ProfileSpec => ({
+      name: 'prod',
+      relationships: [],
+      entities: [
+        {name: 'base', source: BQ('base'), fields: [{name: 'note', ...note}]},
+        {name: 'orders', source: BQ('orders')},
+      ],
+    });
+    const note = (errors: string[]) => errors.filter(e => e.includes('note'));
+    expect(note(validateProfileCompleteness(
+               shop(false), profile({expression: '-- todo'}))))
+        .toEqual([
+          "profile 'prod': entity 'base': field 'note': 'expression' is " +
+              "only a comment; write the field's SQL",
+        ]);
+    expect(note(validateProfileCompleteness(
+               shop(false),
+               profile({dialects: [{dialect: 'NOPE' as any, expression: 'n'}]}))))
+        .toEqual([
+          "profile 'prod': entity 'base': field 'note': 'expression': " +
+              "dialects.0.dialect: Unknown dialect 'NOPE' in expression " +
+              'dialects. Expected one of ANSI_SQL, BIGQUERY, SPANNER, MYSQL, ' +
+              'POSTGRES, ALLOYDB, SNOWFLAKE, DATABRICKS.',
+        ]);
+    // No profile binds an abstract entity, so `orders` still needs its own
+    // binding.
+    expect(note(validateProfileCompleteness(
+               shop(true), profile({expression: 'n'}))))
+        .toEqual([
+          "profile 'prod': field 'orders.note' has no binding in the model " +
+              "file; bind it in 'fields' or leave it out in 'fields_exclude'",
+        ]);
+  });
+
+  // A field the profile lists on an ancestor that does not have it binds
+  // nothing on the entity that declares it.
+  test('completeness still reports a field that a listing on an ancestor does not reach', () => {
+    const shop: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}, {name: 'extra'}],
+        },
+      ],
+    };
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    const profile = loadProfileFile(`name: prod
+entities:
+  - name: base
+    source: ${BQ('base')}
+    fields:
+      - {name: extra, expression: x}
+  - name: orders
+    source: ${BQ('orders')}
+`, 'prod');
+    expect(validateProfileCompleteness(shop, profile)
+               .filter(e => e.includes('extra')))
+        .toEqual([
+          "profile 'prod': field 'base.extra' is not in the logical model",
+          "profile 'prod': field 'orders.extra' has no binding in the model " +
+              "file; bind it in 'fields' or leave it out in 'fields_exclude'",
+        ]);
+  });
+
+  // The binding is left unapplied, so nothing else is blamed on it, but its
+  // problem on an entity that inherits it is its own and push reports it.
+  test('completeness reads a rejected binding with no SQL on each entity that inherits it, as push does', () => {
+    const shop = (note: Partial<Field>): SemanticModel => ({
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}, {name: 'note', ...note}],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+      ],
+    });
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    const profile = (note: Partial<Field>): ProfileSpec => ({
+      name: 'prod',
+      relationships: [],
+      entities: [
+        {name: 'base', source: BQ('base'), fields: [{name: 'note', ...note}]},
+        {name: 'orders', source: BQ('orders')},
+      ],
+    });
+    // The target text is only a comment, and the imported text is only the
+    // qualifier `orders.` on `orders`.
+    const note = {
+      dialects: [
+        {dialect: 'BIGQUERY' as const, expression: '-- t'},
+        {dialect: 'POSTGRES' as const, expression: 'base.orders.'},
+      ],
+    };
+    const own = "the BIGQUERY entry of 'expression' is only a comment";
+    const inherited = "entity 'orders' inherits field 'note': read on " +
+        `'orders', ${own} and the POSTGRES entry of 'expression' is only the ` +
+        "qualifier 'orders.'; write the field's SQL";
+    expect(validatePushRequirements(
+               [{document: 'shop.yaml', model: shop(note)}],
+               {targetOptional: true}))
+        .toEqual([
+          `field 'base.note' in model 'shop' (shop.yaml): ${own}; write ` +
+              "the field's SQL, or remove 'expression' to leave the field " +
+              'unbound.',
+          `model 'shop' (shop.yaml): ${inherited}.`,
+        ]);
+    expect(validateProfileCompleteness(shop({}), profile(note))
+               .filter(e => e.includes('note')))
+        .toEqual([
+          `profile 'prod': entity 'base': field 'note': ${own}; write the ` +
+              "field's SQL",
+          `profile 'prod': ${inherited}`,
+        ]);
+  });
+
+  // Only a binding the reader rejects for holding no SQL is read on each
+  // entity that inherits it, and it is read as applying it would give it.
+  test('completeness reads on inheriting entities only a binding rejected for no SQL, as applying it would give it', () => {
+    const shop: SemanticModel = {
+      name: 'shop',
+      relationships: [],
+      metrics: [],
+      entities: [
+        {
+          name: 'base',
+          dataSource: 'p.d.base',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}, {name: 'note'}],
+        },
+        {
+          name: 'orders',
+          extends: ['base'],
+          dataSource: 'p.d.orders',
+          keys: ['id'],
+          fields: [{name: 'id', expression: 'id'}],
+        },
+      ],
+    };
+    const BQ = (t: string) =>
+        `//bigquery.googleapis.com/projects/p/datasets/d/tables/${t}`;
+    const profile = (note: Partial<Field>): ProfileSpec => ({
+      name: 'prod',
+      relationships: [],
+      entities: [
+        {name: 'base', source: BQ('base'), fields: [{name: 'note', ...note}]},
+        {name: 'orders', source: BQ('orders')},
+      ],
+    });
+    const note = (errors: string[]) => errors.filter(e => e.includes('note'));
+    // Rejected for a repeated dialect.
+    expect(note(validateProfileCompleteness(shop, profile({
+      dialects: [
+        {dialect: 'BIGQUERY', expression: '-- t'},
+        {dialect: 'BIGQUERY', expression: 'base.orders.'},
+      ],
+    })))).toEqual([
+      "profile 'prod': entity 'base': field 'note': 'expression': " +
+          "dialects.1.dialect: Duplicate dialect 'BIGQUERY' in expression " +
+          'dialects.',
+    ]);
+    // A binding with a dialect list applies only the texts in the list.
+    expect(note(validateProfileCompleteness(shop, profile({
+      dialects: [{dialect: 'BIGQUERY', expression: '-- t'}],
+      expression: 'base.orders.',
+    })))).toEqual([
+      "profile 'prod': entity 'base': field 'note': the BIGQUERY entry of " +
+          "'expression' is only a comment; write the field's SQL",
+    ]);
   });
 
   test('a profile held in memory fails first where a profile file would', () => {

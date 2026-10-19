@@ -418,6 +418,13 @@ function withoutExclusions(model: SemanticModel): SemanticModel {
   return out;
 }
 
+// The fields a profile marked as excluded on `model`.
+function fieldExclusionsOf(model: SemanticModel): ProfileExclusion[] {
+  return (model.entities ?? []).flatMap(
+      e => (e.excludedFields ?? [])
+               .map(field => ({model: model.name, entity: e.name, field})));
+}
+
 // Why a graph push of `profileName` cannot go ahead because the profile is a
 // profile file, or undefined when it can. A profile file names no deployment
 // target, and a deployment cannot name a profile yet, so a graph push of one
@@ -653,13 +660,23 @@ async function prepareModels(
     }
   }
   const pushWarnings: string[] = [];
+  // The exclusions a catalog-only push does not apply: a profile file's,
+  // taken off above, and a legacy wrapper's. The check that each inherited
+  // field holds SQL still honors them.
+  const liftedExclusions = prune ?
+      [] :
+      docs.flatMap(
+          d => d.applied ? fieldExclusionsOf(d.applied) : d.excluded ?? []);
   // The pruned model can only repeat an unpruned error, so each is
   // reported once.
   const validationErrors = [...new Set([
     ...unprunedErrors,
-    ...validatePushRequirements(
-        labeled(models),
-        {targetOptional: !prune, fieldsPruned: prune, warnings: pushWarnings}),
+    ...validatePushRequirements(labeled(models), {
+      targetOptional: !prune,
+      fieldsPruned: prune,
+      warnings: pushWarnings,
+      liftedExclusions,
+    }),
   ])];
   for (const w of new Set([...unprunedWarnings, ...pushWarnings])) {
     report.warning(w);
@@ -1405,7 +1422,13 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
           // `deployment_target:` and bare sources, and one with no graph
           // target needs no sources. Push reports a load that fails.
           const loaded = loadSemanticModels(
-              [{name: doc.name, text: res.text, allowLegacyBareSource: true}], {
+              [{
+                name: doc.name,
+                text: res.text,
+                allowLegacyBareSource: true,
+                excluded: res.excluded,
+              }],
+              {
                 defaultProject,
                 bindingOptional: !declaresGraphTarget(res.text),
               });

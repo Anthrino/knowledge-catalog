@@ -223,6 +223,60 @@ describe('inherited-expression localization', () => {
         entityOf(r, 'Customer').fields.find(f => f.name === 'email')!;
     expect(inherited.expression).toBe('LOWER(email)');
   });
+
+  test('a comment comes out first, so a quote inside it keeps no qualifier', () => {
+    // Read with its comment, the apostrophe in `party's` opens a string that
+    // the quote before `unknown` closes, and `Person.` inside it stays. An
+    // ANSI_SQL text is read as BigQuery reads it, where `#` starts a comment.
+    const stringForm = (name: string, text: string): Field => ({
+      name,
+      expression: text,
+      dialects: [{dialect: 'ANSI_SQL', expression: text}],
+      stringForm: true,
+    });
+    const {model: r} = resolveInheritance(model([
+      entity('Person', [], undefined, {
+        fields: [
+          stringForm('name', "-- the party's name\nCOALESCE(Person.name, 'unknown')"),
+          stringForm('title', "# the party's title\nCOALESCE(Person.title, 'none')"),
+        ],
+      }),
+      entity('Customer', ['id'], ['Person']),
+    ]));
+    const inherited = (name: string) =>
+        entityOf(r, 'Customer').fields.find(f => f.name === name)!;
+    expect(inherited('name')).toEqual(
+        stringForm('name', "COALESCE(name, 'unknown')"));
+    expect(inherited('title')).toEqual(
+        stringForm('title', "COALESCE(title, 'none')"));
+  });
+
+  test('each text is read in its own dialect, even when a vendor entry holds the same text', () => {
+    // PostgreSQL reads `#` as an operator, so there the apostrophe opens a
+    // string and `Person.second` inside it keeps its qualifier. The target
+    // text and the BIGQUERY entry are read as BigQuery, where `#` starts a
+    // comment.
+    const text = "Person.first # Person's first\n|| Person.second || ' '";
+    const {model: r} = resolveInheritance(model([
+      entity('Person', [], undefined, {
+        fields: [{
+          name: 'label',
+          expression: text,
+          importedExpression: text,
+          importedDialect: 'POSTGRES',
+          dialects: [
+            {dialect: 'POSTGRES', expression: text},
+            {dialect: 'BIGQUERY', expression: text},
+          ],
+        }],
+      }),
+      entity('Customer', ['id'], ['Person']),
+    ]));
+    const label = entityOf(r, 'Customer').fields.find(f => f.name === 'label')!;
+    expect(label.expression).toBe("first || second || ' '");
+    expect(label.dialects![1].expression).toBe("first || second || ' '");
+    expect(label.dialects![0].expression).toBe(label.importedExpression!);
+  });
 });
 
 

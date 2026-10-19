@@ -14,13 +14,13 @@ import {SpannerClient} from '../gcp/spanner';
 import {googleDeploymentTargets} from './deploy_bigquery';
 import {SpannerGraphTarget, spannerGraphTargets} from './deployment_target';
 import {Action, ActionParameter, Constraint, DATA_TYPES, Executor, Field, FIELD_DEFINITION_KEYS, isFieldBound, Metric, SemanticModel, SQL_EXECUTOR_VERBS} from './ir';
-import {asResourceUri, DEPLOYMENTS_VERSION_HINT, HALF_BOUND_JOIN_PROBLEM, joinLengthProblem, LoadedModel, OSSIE_VERSION, undefinedEndpointProblem} from './loader';
+import {asResourceUri, DEPLOYMENTS_VERSION_HINT, HALF_BOUND_JOIN_PROBLEM, inheritedNoSqlProblems, joinLengthProblem, LoadedModel, noSqlProblemOf, noSqlReason, OSSIE_VERSION, undefinedEndpointProblem} from './loader';
 import {bindScalar, sentence, storeCodeFor} from './parameters';
 import {DeclaredConcept, declaredConceptFields, InheritanceError, resolveInheritance} from './resolve_inheritance';
-import {expressionSources, sourcesDialect} from './resolve_profiles';
+import {applyProfileExclusions, expressionSources, ProfileExclusion, sourcesDialect} from './resolve_profiles';
 import {columnsForSource, entitiesReached, fieldsReadOn, isColumnName, keysCoveredByColumns, referencedEntityNames} from './sql_expr_utils';
 import {leadingDmlVerb, referencedParameters} from './sql_identifiers';
-import {SqlColumn} from './sql_parser';
+import {SqlColumn, withoutComments} from './sql_parser';
 
 // Checks every model against the push requirements and returns the collected
 // error messages (empty when all models pass), each tagged with the model's
@@ -40,12 +40,18 @@ import {SqlColumn} from './sql_parser';
 // `warnings` collects non-fatal messages (such as an expression the SQL parser
 // could not read, whose field references were therefore not checked) for the
 // caller to print.
+//
+// `liftedExclusions` are the fields a binding profile excludes, which a
+// catalog-only push takes off the model so that it publishes every field. The
+// check that each inherited field holds SQL still leaves each one off the
+// entity that excludes it, as applying the profile does.
 export function validatePushRequirements(
     models: LoadedModel[],
     opts: {
       targetOptional?: boolean;
       fieldsPruned?: boolean;
       warnings?: string[];
+      liftedExclusions?: ReadonlyArray<ProfileExclusion>;
     } = {}): string[] {
   const errors: string[] = [];
   for (const {document, model} of models) {
@@ -155,7 +161,7 @@ export function validatePushRequirements(
     const flaggedMetrics = new Set<string>();
     errors.push(...validateExpressionReferences(
         [{document, model}], !!opts.fieldsPruned, opts.warnings,
-        flaggedMetrics));
+        flaggedMetrics, opts.liftedExclusions));
     if (!opts.targetOptional && deployInfo.bigQuery.length > 0) {
       errors.push(...validateBigQueryMetrics(model, document, flaggedMetrics));
     }
@@ -1029,11 +1035,74 @@ function relationshipKeyErrors(
   return errors;
 }
 
-// Validates field and metric expressions when inheritance resolved cleanly:
+// Why each field of `model` holds no SQL, in the loader's words. Each field
+// is read on the entity that declares it, and each field an entity inherits
+// is read on that entity, as the loader does, less each field in
+// `liftedExclusions` on the entity that excludes it. An association's field
+// is an edge property, read on its relationship.
+function fieldNoSqlErrors(
+    model: SemanticModel, document: string,
+    liftedExclusions: ReadonlyArray<ProfileExclusion> = []): string[] {
+  const where = `in model '${model.name}' (${document})`;
+  const errors: string[] = [];
+  for (const e of model.entities ?? []) {
+    for (const f of e.fields ?? []) {
+      const problem = noSqlProblemOf(f, e.name);
+      if (problem) {
+        errors.push(
+            `field '${e.name}.${f.name}' ${where}: ${problem}; write the ` +
+            `field's SQL, or remove 'expression' to leave the field unbound.`);
+      }
+    }
+  }
+  if ((model.entities ?? []).some(e => e.extends?.length)) {
+    const marked = applyProfileExclusions(model, liftedExclusions);
+    const concepts = ifResolvable(() => declaredConcepts(marked));
+    const inherited = concepts ?
+        inheritedNoSqlProblems(marked.entities ?? [], concepts, noSqlProblemOf) :
+        [];
+    for (const problem of inherited) {
+      errors.push(`model '${model.name}' (${document}): ${problem}.`);
+    }
+  }
+  for (const rel of model.relationships ?? []) {
+    for (const f of rel.association?.fields ?? []) {
+      const problem = noSqlProblemOf(f, rel.name);
+      if (problem) {
+        errors.push(
+            `relationship '${rel.name}' field '${f.name}' ${where}: ${
+                problem}; write the field's SQL.`);
+      }
+    }
+  }
+  return errors;
+}
+
+// The error for a metric with no SQL, or undefined. A metric is rejected when
+// none of its texts holds SQL, with or without an anchor, since the graph
+// would drop it. It is also rejected when any one of its texts holds none, as
+// the loader rejects it, since a model built in memory skips the loader.
+function metricNoSqlError(
+    metric: Metric, model: SemanticModel, document: string): string|undefined {
+  const where = `metric '${metric.name}' in model '${model.name}' (${document})`;
+  const readable = expressionSources(metric).filter(
+      s => noSqlReason(s.text, s.dialect) === undefined);
+  if (!readable.length) {
+    return `${where} has no SQL in 'expression'; write the metric's SQL.`;
+  }
+  const problem = noSqlProblemOf(metric);
+  return problem && `${where}: ${problem}; write the metric's SQL.`;
+}
+
+// Validates field and metric expressions:
+//   - Reject a field or a metric with no SQL, as the loader does, since a
+//     model built in memory skips the loader (see fieldNoSqlErrors and
+//     metricNoSqlError).
+// The rules below run when inheritance resolved cleanly:
 //   - For each metric:
-//     1. Reject a metric with no `authoredEntity` (or vanilla GOOGLE block
-//        `entity`) when its expressions, read together, reach no entity or
-//        more than one (or when the metric has no expression and no anchor).
+//     1. Unless it has no SQL, reject a metric with no `authoredEntity` (or
+//        vanilla GOOGLE block `entity`) when its expressions, read together,
+//        reach no entity or more than one.
 //     2. Reject when `authoredEntity ?? entity` does not name a declared
 //        entity (runs on every push).
 //     3. When `authoredEntity` is set and the expressions reference at least
@@ -1052,13 +1121,24 @@ function relationshipKeyErrors(
 // Exported so `commands.ts` can also run it on the unpruned model before
 // `pruneUnavailable` drops unbound fields and metrics on a graph push. When
 // given, `flaggedMetrics` collects the name of each metric it reports.
+// `liftedExclusions` is as validatePushRequirements takes it.
 export function validateExpressionReferences(
     models: LoadedModel[], fieldsPruned = false, warnings: string[] = [],
-    flaggedMetrics?: Set<string>): string[] {
+    flaggedMetrics?: Set<string>,
+    liftedExclusions?: ReadonlyArray<ProfileExclusion>): string[] {
   const errors: string[] = [];
   for (const {document, model} of models) {
+    errors.push(...fieldNoSqlErrors(model, document, liftedExclusions));
     const fieldsByEntity = ifResolvable(() => declaredFields(model));
-    if (!fieldsByEntity) continue;
+    if (!fieldsByEntity) {
+      for (const metric of model.metrics ?? []) {
+        const noSql = metricNoSqlError(metric, model, document);
+        if (!noSql) continue;
+        errors.push(noSql);
+        flaggedMetrics?.add(metric.name);
+      }
+      continue;
+    }
     const entityNames = [...fieldsByEntity.keys()];
     const impliedDialect = sourcesDialect(model);
     const addUnreadableWarning =
@@ -1084,7 +1164,9 @@ export function validateExpressionReferences(
       const others = entityNames.filter(n => n !== entity.name);
       const knownFields = fieldsByEntity.get(entity.name)!;
       for (const field of entity.fields ?? []) {
-        const sources = expressionSources(field);
+        // A text with no SQL has nothing to read, so it gets no warning.
+        const sources = expressionSources(field).filter(
+            s => noSqlReason(s.text, s.dialect, entity.name) === undefined);
         const allColumns: SqlColumn[] = [];
         const unreadDialects: string[] = [];
         for (const {text, dialect} of sources) {
@@ -1128,9 +1210,12 @@ export function validateExpressionReferences(
     for (const metric of model.metrics ?? []) {
       const before = errors.length;
       const sources = expressionSources(metric);
+      // A text with no SQL has nothing to read, so it gets no warning.
+      const readable =
+          sources.filter(s => noSqlReason(s.text, s.dialect) === undefined);
       const allColumns: SqlColumn[] = [];
       const unreadDialects: string[] = [];
-      for (const {text, dialect} of sources) {
+      for (const {text, dialect} of readable) {
         const columns = columnsForSource(text, dialect, impliedDialect);
         if (!columns) {
           unreadDialects.push(dialect);
@@ -1139,20 +1224,18 @@ export function validateExpressionReferences(
         allColumns.push(...columns);
       }
       addUnreadableWarning(
-          `metric '${metric.name}'`, sources.length, unreadDialects);
+          `metric '${metric.name}'`, readable.length, unreadDialects);
 
       const googleEntity = googleMetricEntity(metric);
       const authored = metric.authoredEntity ?? googleEntity;
       const anchor = authored ?? metric.entity;
       const reached = entitiesReached(allColumns, entityNames);
 
-      if (sources.length === 0) {
-        if (anchor === undefined) {
-          errors.push(
-              `metric '${metric.name}' in model '${model.name}' (${
-                  document}) has no expression and no 'entity' anchor; ` +
-              `supply an expression or set 'entity' on the metric.`);
-        }
+      // An anchor does not make up for missing SQL: the graph would drop the
+      // metric.
+      const noSql = metricNoSqlError(metric, model, document);
+      if (noSql) {
+        errors.push(noSql);
       } else if (
           !authored && unreadDialects.length === 0 && allColumns.length === 0 ||
           !authored && reached.length > 1) {
@@ -1266,7 +1349,9 @@ function validateBigQueryMetrics(
           `'BIGQUERY' or 'ANSI_SQL' expression or pass --transpile.`);
       continue;
     }
-    const expr = metric.expression ?? metric.importedExpression ?? '';
+    // The generator reads the expression with its comments removed.
+    const expr = withoutComments(
+        metric.expression ?? metric.importedExpression ?? '', 'BIGQUERY');
     let referenced = referencedEntityNames(expr, entityNames);
     if (referenced.length === 0 && metric.entity) {
       referenced = [metric.entity];
@@ -1275,9 +1360,9 @@ function validateBigQueryMetrics(
       errors.push(
           `${prefix} targets a BigQuery graph and references multiple ` +
           `entities (${referenced.join(', ')}); the BigQuery generator ` +
-          `scans raw expression text (including comments and function ` +
-          `namespaces) for '<entity>.' qualifiers, so remove the extra ` +
-          `'<entity>.' match or scope its expression to one entity.`);
+          `reads every '<entity>.' outside comments as a qualifier, ` +
+          `including a function namespace such as 'NET.', so remove the ` +
+          `extra '<entity>.' match or scope its expression to one entity.`);
     } else if (referenced.length === 0) {
       errors.push(
           `${prefix} targets a BigQuery graph but does not resolve to a ` +

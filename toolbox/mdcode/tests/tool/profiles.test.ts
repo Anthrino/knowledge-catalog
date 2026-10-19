@@ -863,6 +863,87 @@ ${target ? `    deployment_target: ${GRAPH}\n` : ''}\
     });
   }
 
+  // On `customer`, inheritance removes `party.` from `party.customer.` and
+  // leaves only the qualifier `customer.`.
+  const PARTIES = `version: "0.2.0.dev0/google"
+semantic_model:
+  - name: commerce
+    entities:
+      - name: party
+        source: ${BQ('dev', 'party')}
+        primary_key: [id]
+        fields:
+          - { name: id, expression: id }
+          - { name: notes }
+      - name: customer
+        extends: [party]
+        source: ${BQ('dev', 'customer')}
+        primary_key: [id]
+`;
+  const partiesProfile = (exclude: boolean) => `name: prod
+entities:
+  - name: party
+    source: ${BQ('prod', 'party')}
+    fields:
+      - { name: notes, expression: "party.customer." }
+  - name: customer
+    source: ${BQ('prod', 'customer')}
+${exclude ? '    fields_exclude: [notes]\n' : ''}`;
+  const NOTES_INHERITED = "entity 'customer' inherits field 'notes': read " +
+      "on 'customer', 'expression' is only the qualifier 'customer.'; write " +
+      "the field's SQL";
+
+  // A catalog-only push publishes every field, exclusions lifted. The check
+  // that an inherited field holds SQL still leaves out a field the profile
+  // excludes on the entity, as applying the profile does.
+  test('exits 0 when a profile file excludes an inherited field that holds no SQL on the entity', async () => {
+    writeScope({
+      'commerce.yaml': PARTIES,
+      'commerce.profile.prod.yaml': partiesProfile(true),
+    });
+    expect(await pushResult('prod')).toEqual({code: 0, errors: []});
+    expect(await profiles()).toBe(0);
+    expect(profileSection('prod')).toContain('      customer -> acme.prod.customer');
+    expect(errs).toEqual([]);
+    writeScope({'commerce.profile.prod.yaml': partiesProfile(false)});
+    const {code, errors} = await pushResult('prod');
+    expect(code).toBe(1);
+    expect(errors.join('\n')).toContain(NOTES_INHERITED);
+  });
+
+  // The text merged from a legacy wrapper cannot say what the wrapper
+  // excludes, so the load is told.
+  test('exits 0 when a legacy profile excludes an inherited field that holds no SQL on the entity', async () => {
+    const legacy = (exclude: boolean, target: boolean) => `semantic_model:
+  - name: commerce
+${target ? `    deployment_target: ${GRAPH}\n` : ''}\
+    entities:
+      - name: party
+        source: ${BQ('prod', 'party')}
+        fields:
+          - { name: notes, expression: "party.customer." }
+      - name: customer
+        source: ${BQ('prod', 'customer')}
+${exclude ? '        fields_exclude: [notes]\n' : ''}`;
+    for (const target of [false, true]) {
+      writeScope({
+        'commerce.yaml': PARTIES,
+        'commerce.profiles/prod.yaml': legacy(true, target),
+      });
+      expect(await pushResult('prod')).toEqual({code: 0, errors: []});
+      expect(await profiles()).toBe(0);
+      expect(profileSection('prod')).toContain('      customer -> acme.prod.customer');
+      expect(errs).toEqual([]);
+      const runtimes = await createSemanticRuntimes(
+          {path: dir, profile: 'prod', ctx: CTX, onWarning: () => {}});
+      if ('error' in runtimes) throw new Error(runtimes.error);
+      writeScope({'commerce.profiles/prod.yaml': legacy(false, target)});
+      const {code, errors} = await pushResult('prod');
+      expect(code).toBe(1);
+      expect(errors.join('\n')).toContain(NOTES_INHERITED);
+    }
+  });
+
   // Each scope makes `kcmd push --profile prod` fail. A new check push gains
   // needs only a new row here.
   const rejected: Array<[string, Record<string, string>]> = [

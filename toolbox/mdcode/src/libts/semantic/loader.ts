@@ -12,11 +12,11 @@
 import * as yaml from 'yaml';
 import * as z from 'zod';
 
-import {Action, ActionParameter, AffectedConcept, AiContext, ALLOWED_DIALECTS, CONCEPT_OPERATIONS, Constraint, CONSTRAINT_SEVERITIES, CustomExtension, DATA_TYPES, DataType, DialectExpression, Entity, Executor, Field, Metric, normalizeDataType, Relationship, SemanticModel, SqlDialect, VIOLATION_EFFECTS,} from './ir';
+import {Action, ActionParameter, AffectedConcept, AiContext, ALLOWED_DIALECTS, CONCEPT_OPERATIONS, Constraint, CONSTRAINT_SEVERITIES, CustomExtension, DATA_TYPES, DataType, DialectExpression, Entity, Executor, Field, isFieldBound, Metric, normalizeDataType, Relationship, SemanticModel, SqlDialect, VIOLATION_EFFECTS,} from './ir';
 import {DeclaredConcept, declaredConceptFields} from './resolve_inheritance';
-import {sourcesDialect} from './resolve_profiles';
-import {columnsForSource, entitiesReached} from './sql_expr_utils';
-import {SqlColumn} from './sql_parser';
+import {applyProfileExclusions, ProfileExclusion, sourcesDialect} from './resolve_profiles';
+import {columnsForSource, entitiesReached, stripQualifier} from './sql_expr_utils';
+import {holdsNoSql, SqlColumn, withoutComments} from './sql_parser';
 import {YAML_OPTIONS} from './yaml_options';
 
 export interface LoadOptions {
@@ -37,6 +37,12 @@ export interface LoadOptions {
   // they are migrated (b/568184815, b/568186042): accepts bare table names, the
   // legacy instance-based AlloyDB URI, and the legacy `deployment_target:` key.
   allowLegacyBareSource?: boolean;
+  // The fields and metrics a legacy `semantic_model:` profile wrapper
+  // excludes, which the text merged from it cannot say. The check that each
+  // inherited field holds SQL leaves each excluded field off the entity that
+  // excludes it, as applying a profile file does. The loaded model does not
+  // mark them.
+  excluded?: ReadonlyArray<ProfileExclusion>;
 }
 
 export interface LoadResult {
@@ -167,6 +173,155 @@ const expressionSchema = z.union([
   z.string(),
   expressionObjectSchema,
 ]);
+
+// Why `text`, an expression written for `dialect`, holds no SQL: it "is
+// blank", "is only a comment", or, for a field of `entity`, is only that
+// entity's qualifier, which the graph generators remove. Undefined when it
+// holds SQL. The SQL parser decides what is a comment. It reads an ANSI_SQL
+// text as generic SQL and as BigQuery SQL, since the graph generators read
+// that text as BigQuery SQL, where `#` also starts a comment.
+export function noSqlReason(
+    text: string, dialect: string, entity?: string): string|undefined {
+  if (text.trim() === '') return 'is blank';
+  const readers = dialect === 'ANSI_SQL' ? ['ANSI_SQL', 'BIGQUERY'] : [dialect];
+  if (readers.some(d => holdsNoSql(text, d))) return 'is only a comment';
+  if (entity === undefined) return undefined;
+  const onlyQualifier = (d: string) =>
+      stripQualifier(withoutComments(text, d), entity).trim() === '';
+  return readers.some(onlyQualifier) ? `is only the qualifier '${entity}.'` :
+                                       undefined;
+}
+
+// Why an expression cannot load, or undefined. It cannot load when its string
+// form, or any of its dialect entries, holds no SQL. The problem names each
+// such entry. No expression at all passes. `entity` is the entity a field
+// expression belongs to, and is absent for a metric.
+function noSqlProblem(
+    raw: ExpressionDoc|undefined, entity?: string): string|undefined {
+  if (typeof raw === 'string') {
+    const reason = noSqlReason(raw, 'ANSI_SQL', entity);
+    return reason && `'expression' ${reason}`;
+  }
+  return listed((raw?.dialects ?? []).flatMap(d => {
+    const reason = noSqlReason(d.expression, d.dialect, entity);
+    return reason ? [`the ${d.dialect} entry of 'expression' ${reason}`] : [];
+  }));
+}
+
+// `problems` as one list, "a, b and c", or undefined when there are none.
+function listed(problems: string[]): string|undefined {
+  if (problems.length < 2) return problems[0];
+  return `${problems.slice(0, -1).join(', ')} and ${
+      problems[problems.length - 1]}`;
+}
+
+// Whether reading `doc` for a field of `entity` names `text`, or finds every
+// problem that reading `text` in `dialect` finds. The string form and an
+// ANSI_SQL entry are read both as ANSI_SQL and as BigQuery.
+function docReads(
+    doc: ExpressionDoc|undefined, text: string, dialect: string,
+    entity?: string): boolean {
+  const covers = (read: string) => read === dialect ||
+      read === 'ANSI_SQL' && dialect === 'BIGQUERY' ||
+      noSqlReason(text, read, entity) !== undefined;
+  if (typeof doc === 'string') return doc === text && covers('ANSI_SQL');
+  return (doc?.dialects ?? [])
+      .some(d => d.expression === text && covers(d.dialect));
+}
+
+// `f`'s expression as a document writes it: its string form or its dialect
+// list. A binding built in memory with no dialect list gives its imported
+// text as an entry of its imported dialect, which is how the graph generators
+// read it. When it also has a target text, that text is a BIGQUERY entry
+// beside it, as serializeModel writes the two. A target text alone is the
+// string form. So is a target text beside an imported text that a dialect
+// list cannot hold: one with no imported dialect, or one marked BIGQUERY,
+// since a list names each dialect once. An imported text with no imported
+// dialect and no target text is the string form too. Undefined when `f`
+// carries no text.
+export function expressionDocOf(
+    f: Pick<
+        Field,
+        'expression'|'dialects'|'stringForm'|'importedExpression'|
+        'importedDialect'>): string|{dialects: DialectExpression[]}|undefined {
+  if (f.dialects?.length) {
+    return f.stringForm ? f.dialects[0].expression : {dialects: f.dialects};
+  }
+  if (f.importedExpression === undefined || !f.importedDialect ||
+      f.expression !== undefined && f.importedDialect === 'BIGQUERY') {
+    return f.expression ?? f.importedExpression;
+  }
+  const imported = {
+    dialect: f.importedDialect as SqlDialect,
+    expression: f.importedExpression,
+  };
+  return {
+    dialects: f.expression === undefined ?
+        [imported] :
+        [{dialect: 'BIGQUERY', expression: f.expression}, imported],
+  };
+}
+
+// Why a field or metric holds no SQL, or undefined. Its expression is read as
+// a document writes it, as expressionDocOf gives it. Then its target text is
+// read as BigQuery, and its imported text in its imported dialect, or as
+// BigQuery with none, unless that reading already read or named it. The
+// graph generators read each text in that dialect when they write it, and
+// serializeModel writes both. Either text can be outside the dialect list
+// when the field or metric was built in memory, or when push filled
+// `expression` by transpiling. The problem names each text that holds no
+// SQL. `entity` is the entity a field belongs to, and is absent for a metric.
+export function noSqlProblemOf(
+    x: Pick<
+        Field,
+        'expression'|'dialects'|'stringForm'|'importedExpression'|
+        'importedDialect'>,
+    entity?: string): string|undefined {
+  const doc = expressionDocOf(x);
+  const problems = [noSqlProblem(doc, entity)];
+  const texts = [
+    ['expression', x.expression, 'BIGQUERY'],
+    ['importedExpression', x.importedExpression, x.importedDialect ?? 'BIGQUERY'],
+  ] as const;
+  for (const [key, text, dialect] of texts) {
+    if (text === undefined || docReads(doc, text, dialect, entity)) continue;
+    const reason = noSqlReason(text, dialect, entity);
+    problems.push(reason && `'${key}' ${reason}`);
+  }
+  return listed(problems.filter((p): p is string => p !== undefined));
+}
+
+// Why each field an entity inherits holds no SQL on that entity, one message
+// per field. `concepts` gives each entity's fields with inheritance resolved,
+// so an inherited text has lost its ancestor's qualifier. That can leave only
+// the entity's own qualifier, as `base.orders.` does on `orders`, which the
+// graph generators also remove. A field the entity binds itself keeps its own
+// text, which is checked where it is declared, so it is left out. So is
+// every field of an entity that extends no other. A problem that names no
+// entity, such as a `-- todo` text, is reported where the field is declared,
+// so a field is reported on the entity only when the entity adds to it.
+// `problemOf` says why one field holds no SQL, on one entity when one is
+// named. Unless given, it reads the field as a document writes it, each
+// dialect entry in its own dialect, whatever dialect picked the target text.
+export function inheritedNoSqlProblems(
+    entities: Entity[], concepts: Map<string, DeclaredConcept>,
+    problemOf: (f: Field, entity?: string) => string | undefined =
+        (f, entity) => noSqlProblem(expressionDocOf(f), entity)): string[] {
+  const problems: string[] = [];
+  for (const e of entities) {
+    if (!e.extends?.length) continue;
+    const own = new Set((e.fields ?? []).filter(isFieldBound).map(f => f.name));
+    for (const f of concepts.get(e.name)?.fields.values() ?? []) {
+      if (own.has(f.name)) continue;
+      const problem = problemOf(f, e.name);
+      if (problem && problem !== problemOf(f)) {
+        problems.push(`entity '${e.name}' inherits field '${
+            f.name}': read on '${e.name}', ${problem}; write the field's SQL`);
+      }
+    }
+  }
+  return problems;
+}
 
 // The format's AI-first annotation. It appears at every level (model, dataset,
 // field, relationship, metric) and is either a bare instructions string or a
@@ -635,7 +790,23 @@ function buildDocumentSchema(bindingOptional: boolean, extended: boolean) {
             // on it, before generation, so a deployed graph presents only what
             // its binding answers. This is how one logical model serves several
             // stores from different profiles, so it is not a load error under
-            // either `bindingOptional`.
+            // either `bindingOptional`. An `expression` with no SQL is an
+            // error: it binds the field to nothing. A vanilla document's string
+            // form is reported by convertExpression instead, since that form is
+            // the first thing to fix.
+            (ds.fields ?? []).forEach((f: any, i: number) => {
+              if (!extended && typeof f.expression === 'string') return;
+              const problem = noSqlProblem(f.expression, ds.name);
+              if (problem) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  path: ['fields', i, 'expression'],
+                  message: `field '${ds.name}.${f.name}': ${problem}; write ` +
+                      `the field's SQL, or remove 'expression' to leave the ` +
+                      `field unbound`,
+                });
+              }
+            });
           });
 
   const relationship =
@@ -676,6 +847,19 @@ function buildDocumentSchema(bindingOptional: boolean, extended: boolean) {
        })
           .strict()
           .superRefine((mt, ctx) => {
+            // A metric's `expression` is required, so one with no SQL is an
+            // error. A vanilla string form is reported as for a field.
+            const problem = !extended && typeof mt.expression === 'string' ?
+                undefined :
+                noSqlProblem(mt.expression);
+            if (problem) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['expression'],
+                message: `metric '${mt.name}': ${problem}; write the ` +
+                    `metric's SQL`,
+              });
+            }
             if (extended || mt.entity === undefined) return;
             ctx.addIssue({
               code: z.ZodIssueCode.custom,
@@ -1137,6 +1321,10 @@ function protoMemberError(doc: unknown, google: boolean): string|undefined {
 /**
  * Loads YAML or JSON text (a document in the AI-first semantics format) into
  * the Semantic Model IR. `yaml.parse` accepts JSON too, so both are supported.
+ *
+ * A document with a field or metric expression that is not blank needs the SQL
+ * parser, so call `loadSqlEngine()` first. Without it, this throws a plain
+ * Error instead of a SemanticModelError.
  */
 export function loadModels(text: string, opts: LoadOptions = {}): LoadResult {
   let doc: unknown;
@@ -1398,6 +1586,20 @@ function convertModel(
       metrics,
     });
   }
+  // A field a legacy profile wrapper excludes is left off the entity that
+  // excludes it here, though the loaded model does not mark it.
+  let inheritedProblem: string|undefined;
+  if (inheritanceResolved) {
+    const checked = opts.excluded?.length ?
+        declaredConceptFields(applyProfileExclusions(
+            {name: m.name, entities, relationships, metrics}, opts.excluded)) :
+        concepts;
+    inheritedProblem = inheritedNoSqlProblems(entities, checked)[0];
+  }
+  if (inheritedProblem) {
+    throw new SemanticModelError(`Semantic model load error: model '${
+        m.name}': ${inheritedProblem}`);
+  }
   const actions = (m.actions ?? [])
                       .map(
                           a => convertAction(
@@ -1581,9 +1783,20 @@ function fieldExpression(
 // file, checked against the loader's schema and read as a load reads a field's
 // expression, with the texts picked for `dialect`. The string form means
 // ANSI_SQL in either flavor. Throws naming `where` and every problem the schema
-// finds.
+// finds, or naming `where` when the expression holds no SQL for a field of
+// `entity`.
 export function parseFieldExpression(
-    raw: unknown, where: string, dialect: string): FieldExpression {
+    raw: unknown, where: string, dialect: string,
+    entity: string): FieldExpression {
+  return readFieldExpression(
+      raw, where, dialect, doc => noSqlProblem(doc, entity));
+}
+
+// A field expression read as parseFieldExpression reads it, with `problemOf`
+// saying why one the schema accepts holds no SQL.
+export function readFieldExpression(
+    raw: unknown, where: string, dialect: string,
+    problemOf: (doc: ExpressionDoc) => string | undefined): FieldExpression {
   if (typeof raw !== 'string' &&
       (raw === null || typeof raw !== 'object' || Array.isArray(raw))) {
     throw new SemanticModelError(
@@ -1596,7 +1809,31 @@ export function parseFieldExpression(
     throw new SemanticModelError(
         `${where}: 'expression': ${issueList(result.error)}`);
   }
+  const problem = problemOf(result.data);
+  if (problem) {
+    throw new SemanticModelError(`${where}: ${problem}; write the field's SQL`);
+  }
   return fieldExpression(result.data, GOOGLE_VERSION, dialect, where);
+}
+
+// A profile's binding of a field, read as parseFieldExpression reads a
+// profile file's expression. A binding built in memory with no dialect list
+// is read as expressionDocOf gives it, and is checked for SQL as
+// noSqlProblemOf checks it, since a dialect list cannot hold an imported text
+// with no imported dialect, or one marked BIGQUERY beside a target text.
+// Throws as parseFieldExpression does.
+export function parseFieldBinding(
+    binding: Pick<
+        Field,
+        'expression'|'dialects'|'stringForm'|'importedExpression'|
+        'importedDialect'>,
+    where: string, dialect: string, entity: string): FieldExpression {
+  const doc = expressionDocOf(binding);
+  if (binding.dialects?.length) {
+    return parseFieldExpression(doc, where, dialect, entity);
+  }
+  return readFieldExpression(
+      doc, where, dialect, () => noSqlProblemOf(binding, entity));
 }
 
 function convertField(
@@ -2537,17 +2774,30 @@ export interface LoadedModels {
  * A parse/schema error is returned as `error` (naming the document) rather than
  * thrown, mirroring how the deploy legs previously reported it; loader warnings
  * are prefixed with their document name.
+ *
+ * A document's `allowLegacyBareSource` and `excluded` set those load options
+ * for that document alone.
+ *
+ * Each document needs the SQL parser as loadModels does, so call
+ * `loadSqlEngine()` first. Without it, this throws the parser's plain Error.
  */
 export function loadSemanticModels(
-    docs: {name: string; text: string; allowLegacyBareSource?: boolean}[],
+    docs: {
+      name: string; text: string; allowLegacyBareSource?: boolean;
+      excluded?: ReadonlyArray<ProfileExclusion>;
+    }[],
     opts: LoadOptions = {}): LoadedModels {
   const models: LoadedModel[] = [];
   const warnings: string[] = [];
   for (const doc of docs) {
     let loaded: LoadResult;
-    const docOpts = doc.allowLegacyBareSource !== undefined ?
-        {...opts, allowLegacyBareSource: doc.allowLegacyBareSource} :
-        opts;
+    const docOpts = {
+      ...opts,
+      ...(doc.allowLegacyBareSource !== undefined ?
+              {allowLegacyBareSource: doc.allowLegacyBareSource} :
+              {}),
+      ...(doc.excluded ? {excluded: doc.excluded} : {}),
+    };
     try {
       loaded = loadModels(doc.text, docOpts);
     } catch (err) {

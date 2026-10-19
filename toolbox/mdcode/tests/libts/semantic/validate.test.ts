@@ -1064,6 +1064,15 @@ describe('a relationship joins on a key of its target', () => {
     expect(check(ent('customer'), ['`id`'])).toEqual([]);
   });
 
+  test('a key field\'s column is read without its comment, as the generators read it', () => {
+    // The generators emit `KEY(cust_id)` for this field, so a join on
+    // `cust_id` covers the key.
+    const commented = ent('customer', {
+      fields: [{name: 'id', expression: 'cust_id -- the customer number'}],
+    });
+    expect(check(commented, ['cust_id'])).toEqual([]);
+  });
+
   test('a join name matches a field exactly, as the generators read it', () => {
     // The generators read `ID` as a column, not as field `id`, so the join
     // does not reach the key they emit, `cust_id`.
@@ -1635,16 +1644,68 @@ describe('field and metric expression references', () => {
           .toContain("set 'entity' in a GOOGLE custom_extensions block on the metric");
     });
 
-    test('rejects a metric with no expression and no entity anchor with a dedicated message', () => {
+    // An anchor does not make up for missing SQL: the graph would drop the
+    // metric.
+    test('rejects a metric with no SQL, with or without an entity anchor', () => {
+      const message = (name: string) =>
+          `metric '${name}' in model 'm' (doc) has no SQL in 'expression'; ` +
+          "write the metric's SQL.";
       const m = model({
         entities: [orders()],
-        metrics: [{name: 'empty_metric'}],
+        metrics: [
+          {name: 'empty_metric'},
+          {name: 'anchored', entity: 'orders', authoredEntity: 'orders'},
+          {name: 'blank', expression: '  '},
+          {name: 'comment', expression: '-- todo', entity: 'orders'},
+        ],
       });
       expect(validatePushRequirements([loaded(m)], {targetOptional: true}))
           .toEqual([
-            "metric 'empty_metric' in model 'm' (doc) has no expression and " +
-            "no 'entity' anchor; supply an expression or set 'entity' on the metric.",
+            message('empty_metric'),
+            message('anchored'),
+            message('blank'),
+            message('comment'),
           ]);
+    });
+
+    // A model built in memory skips the loader, which rejects these.
+    test('rejects a metric with no SQL in one of its texts in a model built in memory, as the loader does', () => {
+      const m = model({
+        entities: [orders()],
+        metrics: [
+          {
+            name: 'vendor',
+            expression: 'SUM(orders.net_amount)',
+            dialects: [
+              {dialect: 'BIGQUERY', expression: 'SUM(orders.net_amount)'},
+              {dialect: 'POSTGRES', expression: '-- todo'},
+            ],
+          },
+          // The graph generator writes `expression`, which here is not the
+          // text of the dialect entry.
+          {
+            name: 'stale',
+            expression: '',
+            entity: 'orders',
+            dialects: [
+              {dialect: 'POSTGRES', expression: 'SUM(orders.net_amount)'},
+            ],
+          },
+        ],
+      });
+      const expected = [
+        "metric 'vendor' in model 'm' (doc): the POSTGRES entry of " +
+            "'expression' is only a comment; write the metric's SQL.",
+        "metric 'stale' in model 'm' (doc): 'expression' is blank; write " +
+            "the metric's SQL.",
+      ];
+      expect(validatePushRequirements([loaded(m)], {targetOptional: true}))
+          .toEqual(expected);
+      // The BigQuery metric check reports each metric once.
+      const graph = model({...m, customExtensions: [googleExt([BQ_TARGET])]});
+      expect(validatePushRequirements([loaded(graph)], {fieldsPruned: true})
+                 .filter(e => e.startsWith('metric ')))
+          .toEqual(expected);
     });
 
     test('rejects a metric whose anchor names an undeclared entity before and after pruning', () => {
@@ -1773,13 +1834,12 @@ describe('field and metric expression references', () => {
               [loaded(model({version, entities, metrics: [metric]}, [googleExt([BQ_TARGET])]))])
               .join('\n');
 
-      // Comment naming a second entity or function namespace matching an entity name trips the BQ regex,
-      // and passes on a KC-only push or Spanner graph push.
+      // A function namespace matching an entity name trips the BQ regex. A comment naming a second entity
+      // passes on every push, because the generator reads the expression without its comments.
       const commentMetric: Metric = {
         name: 'rev', expression: 'SUM(orders.net_amount) -- customer.id', entity: 'orders',
       };
-      expect(bqPush([orders(), customer()], commentMetric))
-          .toContain("references multiple entities (orders, customer); the BigQuery generator scans raw expression text");
+      expect(bqPush([orders(), customer()], commentMetric)).toBe('');
       expect(validatePushRequirements(
                  [loaded(model({entities: [orders(), customer()], metrics: [commentMetric]}, [googleExt([BQ_TARGET])]))],
                  {targetOptional: true}))
@@ -1793,7 +1853,9 @@ describe('field and metric expression references', () => {
       };
       expect(bqPush([orders(), netEntity], {
         name: 'hosts', expression: 'COUNT(DISTINCT NET.HOST(orders.url))', entity: 'orders',
-      })).toContain('references multiple entities (NET, orders)');
+      })).toContain(
+          "references multiple entities (NET, orders); the BigQuery generator reads every '<entity>.' " +
+          "outside comments as a qualifier, including a function namespace such as 'NET.'");
 
       // Vanilla `COUNT(*)` anchored via a GOOGLE custom_extensions block loads with `metric.entity` unset:
       // KC-only push accepts it, while BigQuery graph push rejects it naming what the BigQuery generator reads.
@@ -2086,6 +2148,421 @@ ${extraMetric}`;
       expect(warnings).toEqual([
         "field 'member.broken' in model 'm' (doc): kcmd could not read its SQL, so the fields it reads were not checked.",
       ]);
+    });
+
+    // A model built in memory skips the loader, which rejects these.
+    test('rejects a field with no SQL in a model built in memory, as the loader does', () => {
+      const message = (field: string, problem: string) =>
+          `field 'orders.${field}' in model 'm' (doc): ${problem}; write ` +
+          "the field's SQL, or remove 'expression' to leave the field unbound.";
+      const fields = [
+        ...orders().fields,
+        {name: 'notes', expression: ''},
+        {name: 'memo', expression: '-- todo'},
+        {name: 'own', expression: 'orders.'},
+        {
+          name: 'vendor',
+          expression: 'o_vendor',
+          dialects: [
+            {dialect: 'BIGQUERY' as const, expression: 'o_vendor'},
+            {dialect: 'POSTGRES' as const, expression: ' '},
+          ],
+        },
+        // The graph generators write `expression`, which here is not the
+        // text of any dialect entry.
+        {
+          name: 'stale',
+          expression: '/* old */',
+          dialects: [{dialect: 'BIGQUERY' as const, expression: 'o_stale'}],
+        },
+        {name: 'pg_note', importedExpression: '-- todo', importedDialect: 'POSTGRES'},
+        // PostgreSQL reads `#` as an operator, so this text holds SQL there.
+        {name: 'pg_points', importedExpression: '# path', importedDialect: 'POSTGRES'},
+      ];
+      const expected = [
+        message('notes', "'expression' is blank"),
+        message('memo', "'expression' is only a comment"),
+        message('own', "'expression' is only the qualifier 'orders.'"),
+        message('vendor', "the POSTGRES entry of 'expression' is blank"),
+        message('stale', "'expression' is only a comment"),
+        message('pg_note', "the POSTGRES entry of 'expression' is only a comment"),
+      ];
+      const kcOnly = model({entities: [{...orders(), fields}]});
+      expect(validatePushRequirements([loaded(kcOnly)], {targetOptional: true}))
+          .toEqual(expected);
+      const graph =
+          model({entities: [{...orders(), fields}]}, [googleExt([BQ_TARGET])]);
+      const errors =
+          validatePushRequirements([loaded(graph)], {fieldsPruned: true});
+      for (const e of expected) expect(errors).toContain(e);
+    });
+
+    test('rejects a field an entity inherits when it has no SQL on that entity', () => {
+      // On `base` the text reads the column `sub`. On `sub`, inheritance
+      // removes `base.` and leaves only the qualifier `sub.`.
+      const base: Entity = {
+        name: 'base',
+        dataSource: 'p.d.base',
+        keys: ['id'],
+        fields: [
+          {name: 'id', expression: 'b_id'},
+          {name: 'label', expression: 'base.sub.'},
+        ],
+      };
+      const sub: Entity = {
+        name: 'sub',
+        extends: ['base'],
+        dataSource: 'p.d.sub',
+        keys: ['id'],
+        fields: [],
+      };
+      const expected = [
+        "model 'm' (doc): entity 'sub' inherits field 'label': read on " +
+            "'sub', 'expression' is only the qualifier 'sub.'; write the " +
+            "field's SQL.",
+      ];
+      const m = model({entities: [base, sub]});
+      expect(validatePushRequirements([loaded(m)], {targetOptional: true}))
+          .toEqual(expected);
+      // The graph generators write `expression`, which here is not the text
+      // of the dialect entry.
+      const stale: Entity = {
+        ...base,
+        fields: [
+          {name: 'id', expression: 'b_id'},
+          {
+            name: 'label',
+            expression: 'base.sub.',
+            dialects: [{dialect: 'BIGQUERY', expression: 'b_label'}],
+          },
+        ],
+      };
+      expect(validatePushRequirements(
+                 [loaded(model({entities: [stale, sub]}))],
+                 {targetOptional: true}))
+          .toEqual(expected);
+      // A catalog-only push lifts a profile's exclusions to publish every
+      // field. A field the profile excludes on `sub` is not read there.
+      expect(validatePushRequirements([loaded(m)], {
+        targetOptional: true,
+        liftedExclusions: [{model: 'm', entity: 'sub', field: 'label'}],
+      })).toEqual([]);
+    });
+
+    // serializeModel writes both texts, and the loader rejects either one with
+    // no SQL, so push reads both.
+    test('rejects an imported text with no SQL beside a target text in a model built in memory', () => {
+      const fieldMessage = (field: string, problem: string) =>
+          `field 'orders.${field}' in model 'm' (doc): ${problem}; write ` +
+          "the field's SQL, or remove 'expression' to leave the field unbound.";
+      const fields = [
+        ...orders().fields,
+        {
+          name: 'notes',
+          expression: 'o_notes',
+          importedExpression: '-- todo',
+          importedDialect: 'POSTGRES',
+        },
+        {name: 'memo', expression: 'o_memo', importedExpression: '/* todo */'},
+        {
+          name: 'tag',
+          expression: 'o_tag',
+          dialects: [{dialect: 'BIGQUERY' as const, expression: 'o_tag'}],
+          importedExpression: ' ',
+          importedDialect: 'POSTGRES',
+        },
+        // PostgreSQL reads `#` as an operator, so this text holds SQL there.
+        {
+          name: 'points',
+          expression: 'o_points',
+          importedExpression: '# path',
+          importedDialect: 'POSTGRES',
+        },
+      ];
+      const m = model({
+        entities: [{...orders(), fields}],
+        metrics: [{
+          name: 'revenue',
+          expression: 'SUM(orders.net_amount)',
+          importedExpression: '-- todo',
+          importedDialect: 'POSTGRES',
+        }],
+      });
+      expect(validatePushRequirements([loaded(m)], {targetOptional: true}))
+          .toEqual([
+            fieldMessage(
+                'notes', "the POSTGRES entry of 'expression' is only a comment"),
+            fieldMessage('memo', "'importedExpression' is only a comment"),
+            fieldMessage('tag', "'importedExpression' is blank"),
+            "metric 'revenue' in model 'm' (doc): the POSTGRES entry of " +
+                "'expression' is only a comment; write the metric's SQL.",
+          ]);
+    });
+
+    // A field an entity binds itself is reported where it is declared, and
+    // every field an entity inherits is read on it, whatever else is wrong.
+    test('rejects every inherited field with no SQL beside a field rejected where it is declared', () => {
+      const base: Entity = {
+        name: 'base',
+        dataSource: 'p.d.base',
+        keys: ['id'],
+        fields: [
+          {name: 'id', expression: 'b_id'},
+          {name: 'label', expression: 'base.sub.'},
+          {name: 'tag', expression: 'base.sub.'},
+          {name: 'memo', expression: 'b_memo'},
+        ],
+      };
+      const sub: Entity = {
+        name: 'sub',
+        extends: ['base'],
+        dataSource: 'p.d.sub',
+        keys: ['id'],
+        fields: [
+          {name: 'own', expression: '-- todo'},
+          {name: 'memo', expression: '/* todo */'},
+        ],
+      };
+      const own = (field: string) =>
+          `field 'sub.${field}' in model 'm' (doc): 'expression' is only a ` +
+          "comment; write the field's SQL, or remove 'expression' to leave " +
+          'the field unbound.';
+      const inherited = (field: string) =>
+          `model 'm' (doc): entity 'sub' inherits field '${field}': read on ` +
+          "'sub', 'expression' is only the qualifier 'sub.'; write the " +
+          "field's SQL.";
+      expect(validatePushRequirements(
+                 [loaded(model({entities: [base, sub]}))],
+                 {targetOptional: true}))
+          .toEqual([
+            own('own'),
+            own('memo'),
+            inherited('label'),
+            inherited('tag'),
+          ]);
+    });
+
+    // Inheritance removes only the ancestor's qualifier, so a text with no
+    // SQL where it is declared has none on any entity that inherits it.
+    test('rejects a field with no SQL where it is declared, and not again on each entity that inherits it', () => {
+      const base: Entity = {
+        name: 'base',
+        dataSource: 'p.d.base',
+        keys: ['id'],
+        fields: [
+          {name: 'id', expression: 'b_id'},
+          {name: 'memo', expression: '-- todo'},
+          {name: 'own', expression: 'base.'},
+          // Its imported text holds SQL on `base` and on `b`, and is only
+          // the qualifier `a.` on `a`.
+          {
+            name: 'mixed',
+            expression: '-- todo',
+            importedExpression: 'base.a.',
+            importedDialect: 'POSTGRES',
+          },
+        ],
+      };
+      const sub = (name: string): Entity => ({
+        name,
+        extends: ['base'],
+        dataSource: `p.d.${name}`,
+        keys: ['id'],
+        fields: [],
+      });
+      expect(validatePushRequirements(
+                 [loaded(model({entities: [base, sub('a'), sub('b')]}))],
+                 {targetOptional: true}))
+          .toEqual([
+            "field 'base.memo' in model 'm' (doc): 'expression' is only a " +
+                "comment; write the field's SQL, or remove 'expression' to " +
+                'leave the field unbound.',
+            "field 'base.own' in model 'm' (doc): 'expression' is only the " +
+                "qualifier 'base.'; write the field's SQL, or remove " +
+                "'expression' to leave the field unbound.",
+            "field 'base.mixed' in model 'm' (doc): the BIGQUERY entry of " +
+                "'expression' is only a comment; write the field's SQL, or " +
+                "remove 'expression' to leave the field unbound.",
+            "model 'm' (doc): entity 'a' inherits field 'mixed': read on " +
+                "'a', the BIGQUERY entry of 'expression' is only a comment " +
+                "and the POSTGRES entry of 'expression' is only the " +
+                "qualifier 'a.'; write the field's SQL.",
+          ]);
+    });
+
+    // A dialect list cannot hold an imported text with no imported dialect,
+    // or one marked BIGQUERY beside a target text, and a model built in
+    // memory can carry an imported text beside its list. Such a text is read
+    // also when the target text has no SQL.
+    test('rejects an inherited field whose imported text outside the dialect list is only the qualifier, beside a target text with no SQL', () => {
+      // Each imported text holds SQL on `base` and is only the qualifier
+      // `a.` on `a`.
+      const base: Entity = {
+        name: 'base',
+        dataSource: 'p.d.base',
+        keys: ['id'],
+        fields: [
+          {name: 'id', expression: 'b_id'},
+          {name: 'loose', expression: '-- todo', importedExpression: 'base.a.'},
+          {
+            name: 'marked',
+            expression: '-- todo',
+            importedExpression: 'base.a.',
+            importedDialect: 'BIGQUERY',
+          },
+          {
+            name: 'listed',
+            dialects: [{dialect: 'BIGQUERY', expression: '-- todo'}],
+            expression: '-- todo',
+            importedExpression: 'base.a.',
+            importedDialect: 'POSTGRES',
+          },
+        ],
+      };
+      const a: Entity = {
+        name: 'a',
+        extends: ['base'],
+        dataSource: 'p.d.a',
+        keys: ['id'],
+        fields: [{name: 'id', expression: 'a_id'}],
+      };
+      const target = (field: string) =>
+          field === 'listed' ? "the BIGQUERY entry of 'expression'" :
+                               "'expression'";
+      expect(validatePushRequirements(
+                 [loaded(model({entities: [base, a]}))],
+                 {targetOptional: true}))
+          .toEqual([
+            ...['loose', 'marked', 'listed'].map(
+                f => `field 'base.${f}' in model 'm' (doc): ${
+                         target(f)} is only a comment; write the field's ` +
+                    "SQL, or remove 'expression' to leave the field unbound."),
+            ...['loose', 'marked', 'listed'].map(
+                f => `model 'm' (doc): entity 'a' inherits field '${
+                         f}': read on 'a', ${target(f)} is only a comment ` +
+                    "and 'importedExpression' is only the qualifier 'a.'; " +
+                    "write the field's SQL."),
+          ]);
+    });
+
+    // Neither check needs inheritance resolved, so neither waits for the
+    // author to fix it.
+    test('rejects a field and a metric with no SQL when inheritance does not resolve', () => {
+      const m = model({
+        entities: [{
+          ...orders(),
+          extends: ['gone'],
+          fields: [...orders().fields, {name: 'memo', expression: '-- todo'}],
+        }],
+        metrics: [
+          {name: 'k', expression: '-- x', entity: 'orders'},
+          {
+            name: 'total',
+            expression: 'SUM(orders.net_amount)',
+            dialects: [
+              {dialect: 'BIGQUERY', expression: 'SUM(orders.net_amount)'},
+              {dialect: 'POSTGRES', expression: '-- todo'},
+            ],
+          },
+        ],
+      });
+      const expected = [
+        "field 'orders.memo' in model 'm' (doc): 'expression' is only a " +
+            "comment; write the field's SQL, or remove 'expression' to leave " +
+            'the field unbound.',
+        "metric 'k' in model 'm' (doc) has no SQL in 'expression'; write " +
+            "the metric's SQL.",
+        "metric 'total' in model 'm' (doc): the POSTGRES entry of " +
+            "'expression' is only a comment; write the metric's SQL.",
+      ];
+      const errors =
+          validatePushRequirements([loaded(m)], {targetOptional: true});
+      expect(errors.join('\n')).toContain("extends unknown entity 'gone'");
+      for (const e of expected) expect(errors).toContain(e);
+      // The BigQuery metric check reports each metric once.
+      const graph = model({...m, customExtensions: [googleExt([BQ_TARGET])]});
+      expect(validatePushRequirements([loaded(graph)], {fieldsPruned: true})
+                 .filter(e => e.startsWith('metric ')))
+          .toEqual(expected.slice(1));
+    });
+
+    test('rejects an association field with no SQL, which the graph writes as an edge property', () => {
+      const m = model(
+          {
+            entities: [orders(), customer()],
+            relationships: [{
+              name: 'bought',
+              source: {entity: 'orders', columns: []},
+              destination: {entity: 'customer', columns: []},
+              association: {
+                dataSource: 'p.d.bought',
+                keys: ['k'],
+                sourceColumns: ['order_id'],
+                destinationColumns: ['customer_id'],
+                fields: [
+                  {name: 'qty', expression: 'b_qty'},
+                  {name: 'note', expression: '# todo'},
+                  {name: 'tag', expression: 'bought.'},
+                ],
+              },
+            }],
+          },
+          [googleExt([BQ_TARGET])]);
+      const errors = validatePushRequirements([loaded(m)]);
+      expect(errors).toContain(
+          "relationship 'bought' field 'note' in model 'm' (doc): " +
+          "'expression' is only a comment; write the field's SQL.");
+      expect(errors).toContain(
+          "relationship 'bought' field 'tag' in model 'm' (doc): " +
+          "'expression' is only the qualifier 'bought.'; write the field's " +
+          'SQL.');
+      expect(errors.join('\n')).not.toContain("field 'qty'");
+    });
+
+    // The error says what is wrong. The warning would say kcmd could not read
+    // SQL that is not there.
+    test('a field or metric rejected for no SQL gets no warning that its SQL could not be read', () => {
+      const m = model({
+        entities: [{
+          ...orders(),
+          fields: [
+            ...orders().fields,
+            {name: 'memo', expression: '-- todo'},
+            {name: 'own', expression: 'orders.'},
+            {
+              name: 'vendor',
+              expression: 'o_vendor',
+              dialects: [
+                {dialect: 'BIGQUERY', expression: 'o_vendor'},
+                {dialect: 'POSTGRES', expression: '/* todo */'},
+              ],
+            },
+          ],
+        }],
+        metrics: [
+          {name: 'k', expression: '-- x', entity: 'orders'},
+          {
+            name: 'total',
+            expression: 'SUM(orders.net_amount)',
+            dialects: [
+              {dialect: 'BIGQUERY', expression: 'SUM(orders.net_amount)'},
+              {dialect: 'POSTGRES', expression: '-- todo'},
+            ],
+          },
+        ],
+      });
+      const warnings: string[] = [];
+      const errors = validatePushRequirements(
+          [loaded(m)], {targetOptional: true, warnings});
+      expect(errors.map(e => e.slice(0, e.indexOf(' in model'))))
+          .toEqual([
+            "field 'orders.memo'",
+            "field 'orders.own'",
+            "field 'orders.vendor'",
+            "metric 'k'",
+            "metric 'total'",
+          ]);
+      expect(warnings).toEqual([]);
     });
   });
 

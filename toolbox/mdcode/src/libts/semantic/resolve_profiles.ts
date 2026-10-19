@@ -38,8 +38,8 @@
 import * as yaml from 'yaml';
 
 import {Action, Entity, expressionForDialect, Field, FIELD_BINDING_KEYS, fieldBinding, isFieldBound, Metric, ProfileEntityBinding, ProfileRelationshipBinding, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
-import {databaseOf, DEFAULT_DIALECT, entityAndMetricWarnings, halfBoundJoinMessage, inferMetricEntities, isAcceptedSource, joinLengthMessage, LoadOptions, loadSemanticModels, parseExecutor, parseFieldExpression, parseSource, SemanticModelError} from './loader';
-import {InheritanceError, resolveInheritance} from './resolve_inheritance';
+import {databaseOf, DEFAULT_DIALECT, entityAndMetricWarnings, expressionDocOf, halfBoundJoinMessage, inferMetricEntities, inheritedNoSqlProblems, isAcceptedSource, joinLengthMessage, LoadOptions, loadSemanticModels, noSqlReason, parseExecutor, parseFieldBinding, parseFieldExpression, parseSource, readFieldExpression, SemanticModelError} from './loader';
+import {declaredConceptFields, InheritanceError, resolveInheritance} from './resolve_inheritance';
 import {columnReferences, entitiesReached, fieldsReadOn, isColumnName, keysCoveredByColumns} from './sql_expr_utils';
 import {SqlColumn} from './sql_parser';
 import {YAML_OPTIONS} from './yaml_options';
@@ -790,7 +790,9 @@ export function pruneUnavailable(
       continue;
     }
     const columns: SqlColumn[] = [];
-    const sources = prunedTexts(mt, dialect);
+    // A text with no SQL has nothing to read.
+    const sources = prunedTexts(mt, dialect)
+                        .filter(s => noSqlReason(s.text, s.dialect) === undefined);
     let unread = 0;
     for (const {text, dialect} of sources) {
       const read = columnReferences(text, dialect);
@@ -868,17 +870,27 @@ function inheritedNamesOf(
     model: SemanticModel, entityName: string,
     byName = new Map((model.entities ?? []).map(e => [e.name, e]))):
     Set<string> {
-  const names = new Set<string>();
+  return new Set(ancestorsOf(entityName, byName)
+                     .flatMap(a => (a.fields ?? []).map(f => f.name)));
+}
+
+// Every ancestor `entityName`'s `extends` reaches, each once. `byName` is the
+// model's entities by name.
+function ancestorsOf(
+    entityName: string, byName: Map<string, Entity>): Entity[] {
+  const ancestors: Entity[] = [];
   const seen = new Set<string>([entityName]);
   const queue = [...(byName.get(entityName)?.extends ?? [])];
   while (queue.length) {
-    const ancestor = queue.shift()!;
-    if (seen.has(ancestor)) continue;
-    seen.add(ancestor);
-    for (const f of byName.get(ancestor)?.fields ?? []) names.add(f.name);
-    queue.push(...(byName.get(ancestor)?.extends ?? []));
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const ancestor = byName.get(name);
+    if (!ancestor) continue;
+    ancestors.push(ancestor);
+    queue.push(...(ancestor.extends ?? []));
   }
-  return names;
+  return ancestors;
 }
 
 // The first unbound "Entity.field" among the columns a metric expression
@@ -1083,6 +1095,18 @@ function applyProfileSpec(
   if (applied.errors.length) {
     return {error: `profile '${profile.name}': ${applied.errors[0]}`};
   }
+  // A field the profile binds is checked on each entity that inherits it, as
+  // a load checks a model file's. A model whose inheritance does not resolve
+  // is reported by validation instead.
+  let concepts;
+  try {
+    concepts = declaredConceptFields(applied.model);
+  } catch (err) {
+    if (!(err instanceof InheritanceError)) throw err;
+  }
+  const inherited =
+      concepts && inheritedNoSqlProblems(applied.model.entities, concepts)[0];
+  if (inherited) return {error: `profile '${profile.name}': ${inherited}`};
   return {
     model: applied.model,
     warnings: warningsAfterProfile(model, applied.model, opts),
@@ -1362,13 +1386,12 @@ function profileStructureErrors(profile: ProfileSpec): string[] {
             `${fat} has no 'expression'; bind it with one, or list it in ` +
             `'fields_exclude'`);
       }
-      if (pf.dialects?.length) {
-        // Checked by the loader's reader, as a profile file's is.
+      // Checked by the loader's reader, as a profile file's is. A binding
+      // with no dialect list, which only a profile built in memory has, is
+      // read as parseFieldBinding reads it.
+      if (expressionDocOf(pf) !== undefined) {
         try {
-          parseFieldExpression(
-              pf.stringForm ? pf.dialects[0].expression :
-                              {dialects: pf.dialects},
-              fat, DEFAULT_DIALECT);
+          parseFieldBinding(pf, fat, DEFAULT_DIALECT, pe.name);
         } catch (err) {
           if (!(err instanceof SemanticModelError)) throw err;
           errors.push(err.message);
@@ -1412,10 +1435,12 @@ function sqlExecutorMessage(
 
 // Applies what `profile` sets on the names `model` declares, and skips any
 // name it does not. applyProfile checks the names first; the profile checks
-// report each unknown name themselves.
+// report each unknown name themselves. With `noSqlAsWritten`, a field binding
+// the reader rejects only for holding no SQL is applied as a valid one is.
 function applyBindings(
     model: SemanticModel, profile: ProfileSpec,
-    opts: ApplyProfileOptions): {model: SemanticModel; errors: string[]} {
+    opts: ApplyProfileOptions&{noSqlAsWritten?: boolean}):
+    {model: SemanticModel; errors: string[]} {
   const errors: string[] = [];
   const out: SemanticModel = structuredClone(model);
   const load = opts.load ?? {};
@@ -1472,16 +1497,20 @@ function applyBindings(
       // rejects one, and validateProfileCompleteness reports it, through
       // profileStructureErrors.
       if (!pf.dialects?.length && !isFieldBound(pf as Field)) continue;
-      // Read as a load reads the same expression in a model file.
-      const dialects = pf.dialects;
-      const binding = dialects?.length ?
-          read(
-              () => parseFieldExpression(
-                  pf.stringForm ? dialects[0].expression : {dialects},
-                  `field '${e.name}.${pf.name}'`, preferred),
-              false) :
-          undefined;
-      if (dialects?.length && !binding) continue;
+      // Read as a load reads the same expression in a model file. One the
+      // reader rejects is left unapplied, also when a profile built in memory
+      // gives it with no dialect list. Under `noSqlAsWritten`, one the reader
+      // rejects only for holding no SQL is read as the schema accepts it.
+      const where = `field '${e.name}.${pf.name}'`;
+      const binding =
+          read(() => parseFieldBinding(pf, where, preferred, e.name), false) ??
+          (opts.noSqlAsWritten ?
+               read(
+                   () => readFieldExpression(
+                       expressionDocOf(pf), where, preferred, () => undefined),
+                   false) :
+               undefined);
+      if (!binding) continue;
       let f = e.fields.find(x => x.name === pf.name);
       if (!f) {
         if (!inherited.has(pf.name)) continue;
@@ -1491,10 +1520,11 @@ function applyBindings(
         e.fields.push(f);
       }
       for (const k of FIELD_BINDING_KEYS) delete f[k];
-      if (binding) {
+      if (pf.dialects?.length) {
         Object.assign(f, binding);
       } else {
-        // A profile built in memory may carry a binding with no dialect list.
+        // A profile built in memory may carry a binding with no dialect list,
+        // which is applied as written.
         for (const k of FIELD_BINDING_KEYS) {
           if (pf[k] !== undefined) (f as any)[k] = structuredClone(pf[k]);
         }
@@ -1673,7 +1703,8 @@ function profileEntity(e: any, where: string): ProfileEntityBinding {
           {name: f.name} :
           {
             name: f.name,
-            ...parseFieldExpression(f.expression, fat, DEFAULT_DIALECT),
+            ...parseFieldExpression(
+                f.expression, fat, DEFAULT_DIALECT, e.name),
           };
     });
   }
@@ -1833,7 +1864,8 @@ function dialectOfSources(sources: string[]): string|undefined {
 /**
  * Returns one message per reason `profile` cannot be deployed against
  * `baseModel`, or an empty list. Checks a single profile: nothing unknown,
- * every concrete entity bound and all in one database, key shapes matching the
+ * every field it binds holding SQL on each entity that inherits it, every
+ * concrete entity bound and all in one database, key shapes matching the
  * model file's where it states keys, every relationship bound, every field the
  * model file leaves unbound accounted for, and exclusions closed under
  * dependency, metrics included. Rules that compare profiles with each other
@@ -1866,6 +1898,19 @@ export function validateProfileCompleteness(
   if (profiledError && !inheritanceErrorOf(baseModel)) {
     errors.push(`${at}: ${profiledError}`);
     return errors;
+  }
+  // A field the profile binds is checked on each entity that inherits it, as
+  // applyProfile checks it. A binding the reader rejects only for holding no
+  // SQL is reported where the profile writes it and left unapplied above.
+  // Applied here, it is also reported on an entity where its expression, read
+  // as a document writes it, has a further problem.
+  if (!profiledError) {
+    const asWritten =
+        applyBindings(baseModel, profile, {noSqlAsWritten: true}).model;
+    const checked = inheritanceErrorOf(asWritten) ? profiled : asWritten;
+    const inherited =
+        inheritedNoSqlProblems(checked.entities, declaredConceptFields(checked));
+    errors.push(...inherited.map(p => `${at}: ${p}`));
   }
   const seenOf = fieldsByEntity(profiled);
   const bindingOf = new Map(profile.entities.map(e => [e.name, e]));
@@ -1914,7 +1959,10 @@ export function validateProfileCompleteness(
     // as the profile's own SQL.
     const others = entities.map(x => x.name).filter(n => n !== pe.name);
     for (const pf of pe.fields ?? []) {
-      for (const {text, dialect: written} of expressionSources(pf)) {
+      // A text with no SQL is reported above, and has nothing to read.
+      const readable = expressionSources(pf).filter(
+          s => noSqlReason(s.text, s.dialect, pe.name) === undefined);
+      for (const {text, dialect: written} of readable) {
         const columns = columnReferences(
             text, written === 'ANSI_SQL' && dialect ? dialect : written);
         if (!columns) {
@@ -2008,9 +2056,15 @@ export function validateProfileCompleteness(
     for (const name of pe?.fieldsExclude ?? []) {
       excluded.add(`${e.name}.${name}`);
     }
-    // A field the profile lists in `fields` is bound by it; one whose
-    // expression the reader rejected is reported once, as that.
-    const rebound = new Set((pe?.fields ?? []).map(f => f.name));
+    // A field the profile lists in `fields`, on this entity or on a concrete
+    // ancestor that has the field, is bound by it. One whose expression the
+    // reader rejected is reported once, as that, where the profile lists it.
+    const listedOn = [e, ...ancestorsOf(e.name, byName).filter(
+                             a => !a.abstract)];
+    const rebound = new Set(listedOn.flatMap(
+        x => (bindingOf.get(x.name)?.fields ?? [])
+                 .map(f => f.name)
+                 .filter(n => x === e || fieldsOf.get(x.name)?.has(n))));
     for (const f of seenOf.get(e.name)?.values() ?? []) {
       if (!isFieldBound(f) && !rebound.has(f.name)) {
         errors.push(
@@ -2086,6 +2140,8 @@ export function validateProfileCompleteness(
       if (metricExcluded.has(m.name)) continue;
       const read: Array<ReadonlyArray<SqlColumn>> = [];
       for (const text of textsFor(m as Field, dialect)) {
+        // A text with no SQL has nothing to read.
+        if (noSqlReason(text.text, text.dialect) !== undefined) continue;
         const columns = columnReferences(text.text, text.dialect);
         if (columns) {
           read.push(columns);
@@ -2277,6 +2333,8 @@ function fieldDependencies(
     if (own) {
       const deps = new Set<string>();
       for (const text of texts(own, dialect)) {
+        // A text with no SQL has nothing to read.
+        if (noSqlReason(text.text, text.dialect, name) !== undefined) continue;
         const columns = columnReferences(text.text, text.dialect);
         if (!columns) {
           unreadable.add(`field '${name}.${field}'`);
