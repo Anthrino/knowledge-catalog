@@ -123,9 +123,15 @@ export class Namer {
         `${slug(model.name)}.metrics.${slug(metric.name)}`;
   }
 
-  /** Bare V2 entry ID for a relationship within a semantic model. */
+  /**
+   * Bare entry ID for a relationship's `semantic-relationship` entry (mapping
+   * Addendum 6): `<model>/relationships/<relationship>` with the second-
+   * generation layout, and the form entityId uses otherwise.
+   */
   relationshipId(model: SemanticModel, rel: Relationship): string {
-    return `${model.name}/relationships/${rel.name}`;
+    return this.v2Aspects ?
+        `${model.name}/relationships/${rel.name}` :
+        `${slug(model.name)}.relationships.${slug(rel.name)}`;
   }
 
   /**
