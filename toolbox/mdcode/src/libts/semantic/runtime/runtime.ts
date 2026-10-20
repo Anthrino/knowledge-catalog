@@ -16,14 +16,14 @@
 
 import {AlloyDbClient} from '../../gcp/alloydb';
 import * as context from '../../gcp/context';
-import {SemanticModelLayout} from '../../layouts/semantic-model';
+import {fileNameOf, SemanticModelLayout} from '../../layouts/semantic-model';
 import {CatalogSnapshot} from '../../snapshot';
 import {Sources} from '../../source';
 import {SemanticModelSource} from '../../sources/semantic-model';
 import {SemanticModel} from '../ir';
-import {loadSemanticModels} from '../loader';
+import {loadSemanticModels, SemanticModelError} from '../loader';
 import {resolveInheritance, ResolveResult} from '../resolve_inheritance';
-import {applyProfileExclusions, DeclaredProfile, declaredProfiles, DEFAULT_PROFILE, modelFileAloneMessage, ProfileExclusion, profileForDocument, reservedProfileNameError, unknownProfileMessage} from '../resolve_profiles';
+import {applyProfileExclusions, DeclaredProfile, declaredProfiles, DEFAULT_PROFILE, isLegacyWrapper, loadProfileFile, ProfileExclusion, profileErrorMessage, profileForDocument, reservedProfileNameError, unknownProfileMessage} from '../resolve_profiles';
 import {loadSqlEngine} from '../sql_parser';
 
 import {resolveStore, Store, withPrimaryInstance} from './store';
@@ -155,20 +155,27 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
   // Push reads every model's profiles first, whichever profile it deploys:
   // its profile files, then the profiles a vanilla model carries in its
   // GOOGLE block. It refuses the scope when profileDocuments rejects a file,
-  // such as one whose `name:` does not match its file name, or when a GOOGLE
-  // block profile does not load. It also refuses it when a model declares a
-  // profile named `default` in any letter case.
+  // such as a `<model>.profile.<name>.yaml` file whose `name:` does not match
+  // its file name, or when a GOOGLE block profile does not load. It also
+  // refuses it when a model declares a profile named `default` in any letter
+  // case.
   const profilesByDoc = new Map<string, DeclaredProfile[]>();
+  // Each model's profile files alone, which an error applying one names.
+  const filesByDoc =
+      new Map<string, Array<{name: string; text: string; path: string}>>();
   for (const doc of docs) {
+    let files: Array<{name: string; text: string; path: string}>;
     let available: DeclaredProfile[];
     try {
-      available = declaredProfiles(doc, layout.profileDocuments(doc.name));
+      files = layout.profileDocuments(doc.name);
+      available = declaredProfiles(doc, files);
     } catch (err: any) {
       return {error: err?.message ?? String(err)};
     }
     const reserved = reservedProfileNameError(doc.name, available);
     if (reserved) return {error: reserved};
     profilesByDoc.set(doc.name, available);
+    filesByDoc.set(doc.name, files);
   }
 
   const merged: Array<{
@@ -190,16 +197,15 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
       merged.push({name: doc.name, text: doc.text});
       continue;
     }
-    const res =
-        profileForDocument(doc, profilesByDoc.get(doc.name) ?? [], profile);
+    const available = profilesByDoc.get(doc.name) ?? [];
+    const res = profileForDocument(doc, available, profile);
     if (res.kind === 'missing') {
       return {error: unknownProfileMessage(profile, doc.name, res.declared)};
     }
     if (res.kind === 'error') {
-      return {
-        error: res.stage === 'load' ? modelFileAloneMessage(res.error, profile) :
-                                      `[${doc.name}] ${res.error}`,
-      };
+      const files = (filesByDoc.get(doc.name) ?? []).map(
+          p => ({...p, fileName: fileNameOf(layout, doc.name, p.path)}));
+      return {error: profileErrorMessage(doc.name, res, profile, files)};
     }
     if (res.kind === 'file') {
       fileWarnings.set(doc.name, res.warnings);
@@ -241,6 +247,22 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
     const declared = (profilesByDoc.get(document) ?? []).map(p => p.name);
     const error = undeclaredProfileError(document, model, declared);
     if (error) return {error};
+  }
+
+  // Push then loads every profile file, whichever profile it deploys, and
+  // refuses one that does not load. It merges a legacy `semantic_model:`
+  // wrapper only when that wrapper's profile applies.
+  for (const doc of docs) {
+    for (const p of filesByDoc.get(doc.name) ?? []) {
+      if (isLegacyWrapper(p.text)) continue;
+      try {
+        loadProfileFile(p.text, p.name, {skipActions: true});
+      } catch (err) {
+        if (!(err instanceof SemanticModelError)) throw err;
+        const file = fileNameOf(layout, doc.name, p.path);
+        return {error: `[${file}] ${err.message}`};
+      }
+    }
   }
 
   if (options.oneModel && models.length > 1) {
