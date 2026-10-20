@@ -241,3 +241,138 @@ describe('kcmd entry, as a process', () => {
     expect(stderr).toContain('cannot read 1 of the entries');
   }, 30000);
 });
+
+function writeItems(items: unknown, file = 'items.json'): string {
+  fs.writeFileSync(file, JSON.stringify(items));
+  return file;
+}
+
+function entryOnDisk(file: string): any {
+  return yaml.parse(fs.readFileSync(path.join('catalog', file), 'utf8'));
+}
+
+describe('kcmd entry save', () => {
+  test('saves one entry given as an object', async () => {
+    writeStandardWorkspace();
+    const created = {name: 'payments', type: 'test-project.us.table', resource: {}};
+    expect(await entry('save', [writeItems(created)])).toBe(0);
+    expect(printed()).toEqual([{name: 'payments', ok: true}]);
+    expect(entryOnDisk('payments.yaml')).toEqual(created);
+  });
+
+  test('applies many items in order and reports each, in order', async () => {
+    writeStandardWorkspace();
+    const file = writeItems([
+      {name: 'payments', type: 'test-project.us.table', resource: {}},
+      {...ORDERS, resource: {...ORDERS.resource, description: 'Updated.'}},
+      {name: 'bad', type: 'test-project.us.table', aspect: {}},
+      {name: 'payments', type: 'test-project.us.table', resource: {}},
+      {type: 'test-project.us.table'},
+      {name: '../escape', type: 'test-project.us.table'},
+    ]);
+
+    expect(await entry('save', [file])).toBe(1);
+    const results = printed();
+    expect(results.map((r: any) => [r.name, r.ok])).toEqual([
+      ['payments', true],
+      ['orders', true],
+      ['bad', false],
+      ['payments', false],
+      ['(item 5)', false],
+      ['../escape', false],
+    ]);
+    expect(results[2].error).toContain('Unrecognized key');
+    expect(results[2].error).toContain('aspect');
+    expect(results[3].error).toContain('appears more than once');
+    expect(results[4].error).toContain('name');
+    expect(results[5].error).toContain('points outside the catalog folder');
+    expect(entryOnDisk('orders.yaml').resource.description).toBe('Updated.');
+    expect(fs.existsSync(path.join('catalog', 'bad.yaml'))).toBe(false);
+  });
+
+  test('what entry get prints saves back without writing anything',
+       async () => {
+         writeStandardWorkspace();
+         expect(await entry('get', ['orders', 'sub/refunds'])).toBe(0);
+         const file = writeItems(printed());
+         const past = new Date('2020-01-01T00:00:00Z');
+         for (const f of ['orders.yaml', path.join('sub', 'refunds.yaml')]) {
+           fs.utimesSync(path.join('catalog', f), past, past);
+         }
+
+         out = [];
+         expect(await entry('save', [file])).toBe(0);
+         expect(printed().every((r: any) => r.ok)).toBe(true);
+         for (const f of ['orders.yaml', path.join('sub', 'refunds.yaml')]) {
+           expect(fs.statSync(path.join('catalog', f)).mtime.toISOString())
+               .toBe(past.toISOString());
+         }
+       });
+
+  test('input that is not JSON fails the call and writes nothing', async () => {
+    writeStandardWorkspace();
+    fs.writeFileSync('items.json', '{"name": ');
+    expect(await entry('save', ['items.json'])).toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join('\n')).toContain('\'items.json\' is not valid JSON');
+  });
+
+  test('a missing file fails the call', async () => {
+    writeStandardWorkspace();
+    expect(await entry('save', ['nope.json'])).toBe(1);
+    expect(out).toEqual([]);
+    expect(err.join('\n')).toContain('cannot read \'nope.json\'');
+  });
+});
+
+describe('kcmd entry delete', () => {
+  test('deletes each name and reports the ones it cannot', async () => {
+    writeStandardWorkspace();
+    expect(await entry('delete', ['orders', 'nope'])).toBe(1);
+    expect(printed()).toEqual([
+      {name: 'orders', ok: true},
+      {name: 'nope', ok: false, error: 'Entry not found: nope'},
+    ]);
+    expect(fs.existsSync(path.join('catalog', 'orders.yaml'))).toBe(false);
+  });
+
+  test('exits 0 when every name is deleted', async () => {
+    writeStandardWorkspace();
+    expect(await entry('delete', ['sub/refunds'])).toBe(0);
+    expect(printed()).toEqual([{name: 'sub/refunds', ok: true}]);
+  });
+});
+
+describe('kcmd entry save and delete usage', () => {
+  const cases: [string, string, string[], string][] = [
+    ['save without a file', 'save', [], 'takes one file'],
+    ['save with two files', 'save', ['a.json', 'b.json'], 'takes one file'],
+    ['delete without names', 'delete', [], 'needs at least one entry name'],
+  ];
+  for (const [label, action, args, message] of cases) {
+    test(`${label} fails before opening the workspace`, async () => {
+      expect(await entry(action, args)).toBe(1);
+      expect(out).toEqual([]);
+      expect(err.join('\n')).toContain(message);
+    });
+  }
+});
+
+describe('kcmd entry save, as a process', () => {
+  test('reads standard input and prints one result per item', () => {
+    writeSemanticWorkspace();
+    const p = Bun.spawnSync({
+      cmd: ['bun', MAIN, 'entry', 'save', '-'],
+      cwd: dir,
+      stdin: Buffer.from(JSON.stringify(
+          [{name: 'refunds', type: 'dataplex-types.global.semantic-entity'}])),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(p.exitCode).toBe(1);
+    const results = JSON.parse(p.stdout.toString());
+    expect(results).toHaveLength(1);
+    expect(results[0].name).toBe('refunds');
+    expect(results[0].ok).toBe(false);
+  }, 30000);
+});
