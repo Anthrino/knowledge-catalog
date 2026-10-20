@@ -14,6 +14,7 @@ import * as yaml from 'yaml';
 
 import {CatalogLayout} from '../layout';
 import * as md from '../metadata';
+import {modelDocumentVersion} from '../semantic/loader';
 import {PROFILE_NAME} from '../semantic/resolve_profiles';
 import {YAML_OPTIONS} from '../semantic/yaml_options';
 
@@ -371,17 +372,27 @@ export class SemanticModelLayout implements CatalogLayout {
   }
 
   // The `version` and model `name` a model document declares, each undefined
-  // when the document has none or does not parse; the loader reports both.
+  // when the document has none. In a document with a YAML error, the version
+  // is read as the lookup of its GOOGLE block profiles reads it, and is
+  // undefined when the error may change it. The name is undefined then, since
+  // the error can change the name the text seems to declare. The loader
+  // reports the error.
   private _modelHeader(model: string): {version?: string; name?: string} {
     const localPath = this._index.get(model);
     if (!localPath) return {};
     try {
-      const doc = yaml.parse(fs.readFileSync(localPath, 'utf8'), YAML_OPTIONS);
+      const text = fs.readFileSync(localPath, 'utf8');
+      let doc: any;
+      try {
+        doc = yaml.parse(text, YAML_OPTIONS);
+      } catch {
+        // A YAML error; the name stays undefined.
+      }
       const name = Array.isArray(doc?.semantic_model) ?
           doc.semantic_model[0]?.name :
           undefined;
       return {
-        version: typeof doc?.version === 'string' ? doc.version : undefined,
+        version: modelDocumentVersion(text),
         name: typeof name === 'string' ? name : undefined,
       };
     } catch {

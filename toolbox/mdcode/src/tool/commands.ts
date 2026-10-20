@@ -19,10 +19,10 @@ import * as deploySpannerLeg from '../libts/semantic/deploy_spanner';
 import {googleBlockTargets, googleDeploymentTargets} from '../libts/semantic/deployment_target';
 import {SemanticModel} from '../libts/semantic/ir';
 import {FILE_COPY_TYPE_ID, FileCopy, provisionCustomTypes} from '../libts/semantic/kc_custom_types';
-import {asResourceUri, deploymentProfileError, LoadedModel, loadSemanticModels, setsAKeyTwice} from '../libts/semantic/loader';
+import {asResourceUri, deploymentProfileError, LoadedModel, loadSemanticModels, SemanticModelError, setsAKeyTwice} from '../libts/semantic/loader';
 import {serializeModel} from '../libts/semantic/osi_converter';
 import * as pullKc from '../libts/semantic/pull_kc';
-import {applyProfileExclusions, AvailabilityReport, DEFAULT_PROFILE, DocumentProfile, isProfileFileForm, modelFileAloneMessage, ProfileExclusion, profileForDocument, profileSourceMessage, pruneUnavailable, reservedProfileNameError, unknownProfileMessage,} from '../libts/semantic/resolve_profiles';
+import {applyProfileExclusions, AvailabilityReport, DeclaredProfile, declaredProfiles, DEFAULT_PROFILE, DocumentProfile, isProfileFileForm, modelFileAloneMessage, ProfileExclusion, profileForDocument, profileSourceMessage, pruneUnavailable, reservedProfileNameError, unknownProfileMessage,} from '../libts/semantic/resolve_profiles';
 import {createSemanticRuntimes} from '../libts/semantic/runtime/runtime';
 import {profileTargets, storeLine} from '../libts/semantic/runtime/store';
 import {generateSkill, SkillPackage} from '../libts/semantic/skills';
@@ -447,7 +447,8 @@ function fieldExclusionsOf(model: SemanticModel): ProfileExclusion[] {
 }
 
 // Why a graph push of `profileName` cannot go ahead because the profile is a
-// profile file, or undefined when it can. A profile file names no deployment
+// named profile, or undefined when it can. A named profile is a profile file
+// or a profile in a vanilla model's GOOGLE block. It names no deployment
 // target, and a deployment cannot name a profile yet, so a graph push of one
 // would deploy into the model file's own target, whatever system the profile
 // binds.
@@ -455,12 +456,12 @@ export function profileFileGraphError(
     docs: ProfiledDoc[], profileName: string): string|undefined {
   const fileForm = docs.find(d => d.applied);
   if (!fileForm) return undefined;
-  return `[${fileForm.name}] binding profile '${profileName}' is a profile ` +
-      `file, which names no deployment target, and a deployment cannot name ` +
-      `a profile yet; a graph push would deploy it into the model file's own ` +
-      `target. Run 'kcmd push --profile default' to deploy the model file's ` +
-      `own bindings, or 'kcmd push --no-profile' to publish to Knowledge ` +
-      `Catalog without deploying a graph.`;
+  return `[${fileForm.name}] binding profile '${profileName}' is a named ` +
+      `profile, which names no deployment target, and a deployment cannot ` +
+      `name a profile yet; a graph push would deploy it into the model ` +
+      `file's own target. Run 'kcmd push --profile default' to deploy the ` +
+      `model file's own bindings, or 'kcmd push --no-profile' to publish to ` +
+      `Knowledge Catalog without deploying a graph.`;
 }
 
 // Gives a model's profile files as layout.profileDocuments does.
@@ -476,6 +477,40 @@ function profileDocsReader(layout: SemanticModelLayout): ProfileDocs {
     if (!read.has(model)) read.set(model, layout.profileDocuments(model));
     return read.get(model)!;
   };
+}
+
+// Gives the profiles a model document declares: its profile files, then the
+// profiles a vanilla model carries in its GOOGLE block.
+type DeclaredProfiles = (doc: {name: string; text: string}) =>
+    DeclaredProfile[];
+
+// Reads a model document's declared profiles on the first call for that
+// document and returns them again on later calls. Throws when its profile
+// files or the profiles in its GOOGLE blocks cannot be read.
+function declaredProfilesReader(profileDocs: ProfileDocs): DeclaredProfiles {
+  const read = new Map<string, DeclaredProfile[]>();
+  return doc => {
+    if (!read.has(doc.name)) {
+      read.set(doc.name, declaredProfiles(doc, profileDocs(doc.name)));
+    }
+    return read.get(doc.name)!;
+  };
+}
+
+// The profiles `doc` declares, read with `declared`. When the profiles in a
+// vanilla model's GOOGLE blocks cannot be read, prints the same error the
+// runtime returns and gives undefined. Throws when a profile file breaks a
+// layout rule.
+function readDeclaredProfiles(declared: DeclaredProfiles, doc: {
+  name: string; text: string
+}): DeclaredProfile[]|undefined {
+  try {
+    return declared(doc);
+  } catch (err) {
+    if (!(err instanceof SemanticModelError)) throw err;
+    console.error(`Error: ${err.message}`);
+    return undefined;
+  }
 }
 
 // The file copies of each model file and of each of its profile files: each
@@ -789,7 +824,12 @@ export async function push(options: PushOptions): Promise<number> {
 
     const layoutDocs = layout.modelDocuments();
     const profileDocs = profileDocsReader(layout);
+    const declared = declaredProfilesReader(profileDocs);
     const defaultProject = source.project ?? ctx.project;
+
+    // Reading a GOOGLE block profile checks its field bindings for SQL, which
+    // needs the SQL parser.
+    if (!await sqlParserReady()) return 1;
 
     // Reserve the profile name 'default': it is the sentinel for the inline
     // bindings (never merged onto the document), so a
@@ -798,18 +838,20 @@ export async function push(options: PushOptions): Promise<number> {
     // on: a graph push may resolve profiles, but a catalog-only --no-profile
     // push resolves none, so it does not police their names here. With
     // KC_V2_ASPECTS off it still reads every profile file to store it, and the
-    // layout's file rules apply then.
+    // layout's file rules apply then. A graph push reads every model's
+    // profiles here, so GOOGLE block profiles that cannot be read stop it with
+    // exit 1.
     if (graphEnabled) {
       for (const doc of layoutDocs) {
-        const clash = reservedProfileNameError(doc.name, profileDocs(doc.name));
+        const docProfiles = readDeclaredProfiles(declared, doc);
+        if (!docProfiles) return 1;
+        const clash = reservedProfileNameError(doc.name, docProfiles);
         if (clash) {
           console.error(`Error: ${clash}`);
           return 1;
         }
       }
     }
-
-    if (!await sqlParserReady()) return 1;
 
     // Apply one binding profile to every model document, returning the docs
     // (or null after reporting an error): a profile file is applied to the
@@ -828,8 +870,9 @@ export async function push(options: PushOptions): Promise<number> {
           for (const doc of layoutDocs) {
             // A profile file applies to the model file loaded on its own,
             // since its sources may all be in profile files.
-            const res =
-                profileForDocument(doc, profileDocs(doc.name), profileName);
+            const docProfiles = readDeclaredProfiles(declared, doc);
+            if (!docProfiles) return null;
+            const res = profileForDocument(doc, docProfiles, profileName);
             if (res.kind === 'missing') {
               if (skipMissing) continue;
               console.error(`Error: ${
@@ -890,7 +933,7 @@ export async function push(options: PushOptions): Promise<number> {
       if (allProfiles) {
         const names = new Set<string>();
         for (const doc of layoutDocs) {
-          for (const p of profileDocs(doc.name)) names.add(p.name);
+          for (const p of declared(doc)) names.add(p.name);
           if (declaresGraphTarget(doc.text)) names.add(DEFAULT_PROFILE);
         }
         for (const n of [...names].filter(n => n !== DEFAULT_PROFILE).sort()) {
@@ -1339,7 +1382,8 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
   const defaultProject = source.project ?? ctx.project;
   const errorsFor = (doc: ProfiledDoc, name: string) =>
       pushErrors(doc, name, defaultProject, ctx);
-  const declaredBy = profileDocsReader(layout);
+  const profileDocs = profileDocsReader(layout);
+  const declaredBy = declaredProfilesReader(profileDocs);
   // The inline bindings' header. 'default' is not a profile document and
   // never can be -- a push rejects a file by that name. It names the inline
   // bindings, which every model has.
@@ -1347,9 +1391,12 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
       `  profile '${DEFAULT_PROFILE}': the model document's own inline ` +
       `bindings, as authored -- nothing merged, nothing withheld.`;
 
-  // The profiles are read before anything prints, so a profile file that
-  // breaks a layout rule throws as it does in push.
-  for (const doc of docs) declaredBy(doc.name);
+  // The profiles are read before anything prints, as push reads them. A
+  // profile file that breaks a layout rule throws. When a model's GOOGLE block
+  // profiles cannot be read, the error is printed and the command exits 1.
+  for (const doc of docs) {
+    if (!readDeclaredProfiles(declaredBy, doc)) return 1;
+  }
   // Push publishes to Knowledge Catalog one model per entry group.
   if (docs.length > 1) {
     printRejects(
@@ -1359,27 +1406,27 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
   // profile file, and checks the copies before any graph deploys. Its lookup
   // of the type that holds them calls a service, so it runs only at push time.
   if (!kcV2Aspects() && docs.length === 1) {
-    const {error} = checkedFileCopies(layout, docs, declaredBy);
+    const {error} = checkedFileCopies(layout, docs, profileDocs);
     if (error) printRejects('', [error]);
   }
 
   for (const doc of docs) {
     console.log(`Model '${doc.name}' (${source.entryGroup}):`);
-    const profileFiles = declaredBy(doc.name);
+    const modelProfiles = declaredBy(doc);
     const modelErrors: string[] = [];
     // Push refuses every graph push while a model declares a profile named
     // 'default', whichever binding it deploys.
-    const reserved = reservedProfileNameError(doc.name, profileFiles);
+    const reserved = reservedProfileNameError(doc.name, modelProfiles);
     if (reserved) modelErrors.push(reserved);
     // Push deploys no profile under that name, so it is neither merged nor
     // listed.
     const declared =
-        profileFiles.filter(p => p.name.toLowerCase() !== DEFAULT_PROFILE);
+        modelProfiles.filter(p => p.name.toLowerCase() !== DEFAULT_PROFILE);
     // A push that names no profile deploys `default_profile`. It fails when
     // this model does not declare that profile.
     if (!only && defaultProfile !== undefined &&
         defaultProfile !== DEFAULT_PROFILE &&
-        !profileFiles.some(p => p.name === defaultProfile)) {
+        !modelProfiles.some(p => p.name === defaultProfile)) {
       modelErrors.push(unknownProfileMessage(
           defaultProfile, doc.name, declared.map(p => p.name)));
     }
@@ -1401,7 +1448,7 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
     if (only && !available.length) {
       // A profile file under the reserved name is reported above, as push
       // reports it.
-      if (profileFiles.some(p => p.name === only)) continue;
+      if (modelProfiles.some(p => p.name === only)) continue;
       console.error(
           `  no profile '${only}'; this model declares ` +
           (declared.length ?
@@ -1410,7 +1457,7 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
       missing = true;
       continue;
     }
-    if (!profileFiles.length) {
+    if (!modelProfiles.length) {
       console.log(
           `  no binding profiles; the model document is its own inline ` +
           `'default' binding.`);
@@ -1424,7 +1471,7 @@ export async function profiles(options: ProfilesOptions = {}): Promise<number> {
       // Push applies the profile to every model in the scope, so a model that
       // does not declare it fails the push.
       const errors = docs.filter(d => d.name !== doc.name).flatMap(d => {
-        const names = declaredBy(d.name).map(p => p.name);
+        const names = declaredBy(d).map(p => p.name);
         return names.includes(name) ?
             [] :
             [unknownProfileMessage(name, d.name, names)];

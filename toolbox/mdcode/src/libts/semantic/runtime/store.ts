@@ -385,12 +385,12 @@ function deploymentsFor(
     model: SemanticModel, profile: string, legacyWrapper: boolean):
     {model: SemanticModel; owner: string}|{error: string} {
   const nothingToRun = `so there is no database to run it against`;
-  const profileFile = `binding profile '${profile}' is a profile file, ` +
+  const namedProfile = `binding profile '${profile}' is a named profile, ` +
       `which names no deployment target`;
   if (!model.deployments?.length) {
     return profile === DEFAULT_PROFILE || legacyWrapper ?
         {model, owner: DEFAULT_PROFILE} :
-        {error: `${profileFile}, ${nothingToRun}`};
+        {error: `${namedProfile}, ${nothingToRun}`};
   }
   const usedBy = (name: string) => model.deployments!.filter(
       d => (d.profile ?? DEFAULT_PROFILE) === name);
@@ -401,12 +401,12 @@ function deploymentsFor(
     used = usedBy(DEFAULT_PROFILE);
   }
   if (!used.length) {
+    // A vanilla model lists its deployments in its GOOGLE block.
+    const listed = model.version === OSSIE_VERSION ?
+        `its GOOGLE block's 'deployments'` :
+        `'deployments'`;
     let error: string;
     if (profile === DEFAULT_PROFILE) {
-      // A vanilla model lists its deployments in its GOOGLE block.
-      const listed = model.version === OSSIE_VERSION ?
-          `its GOOGLE block's 'deployments'` :
-          `'deployments'`;
       error = `Model '${model.name}' declares no deployment without a ` +
           `'profile' in ${listed}, so there is no store to run against ` +
           `under binding profile '${DEFAULT_PROFILE}'.`;
@@ -415,7 +415,7 @@ function deploymentsFor(
           `'deployment_target', and every deployment in 'deployments' names ` +
           `another profile, ${nothingToRun}`;
     } else {
-      error = `${profileFile}, and no deployment in 'deployments' uses it, ${
+      error = `${namedProfile}, and no deployment in ${listed} uses it, ${
           nothingToRun}`;
     }
     return {error};

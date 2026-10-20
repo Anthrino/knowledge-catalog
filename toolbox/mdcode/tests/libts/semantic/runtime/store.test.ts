@@ -446,7 +446,7 @@ describe('the store a profile uses', () => {
     const store = resolveStore(threeProfiles, 'staging');
     expect('error' in store && store.error)
         .toBe(
-            "binding profile 'staging' is a profile file, which names no " +
+            "binding profile 'staging' is a named profile, which names no " +
             "deployment target, and no deployment in 'deployments' uses it, so " +
             'there is no database to run it against');
   });
@@ -534,6 +534,19 @@ describe('the store a profile uses', () => {
             "against under binding profile 'default'.");
   });
 
+  test('a block profile no block deployment uses has no store, naming the block', () => {
+    const vanilla = vanillaModel({
+      profiles: [{name: 'operational'}, {name: 'staging'}],
+      deployments: [{name: 'spanner_a', target: SPANNER_GRAPH, profile: 'operational'}],
+    });
+    const store = resolveStore(vanilla, 'staging');
+    expect('error' in store && store.error)
+        .toBe(
+            "binding profile 'staging' is a named profile, which names no " +
+            "deployment target, and no deployment in its GOOGLE block's " +
+            "'deployments' uses it, so there is no database to run it against");
+  });
+
   test('a deployment that names no destination is reported beside one that does',
        () => {
          const typo =
@@ -586,7 +599,7 @@ describe('the store a profile uses', () => {
     };
     expect(resolveStore(vanilla, 'prod'))
         .toEqual({
-          error: "binding profile 'prod' is a profile file, which names no " +
+          error: "binding profile 'prod' is a named profile, which names no " +
               'deployment target, so there is no database to run it against',
         });
     const store = resolveStore(vanilla, 'default');
@@ -614,7 +627,7 @@ describe('the store a profile uses', () => {
     const emptyDeployments: SemanticModel = {...threeProfiles, deployments: []};
     expect(resolveStore(emptyDeployments, 'prod'))
         .toEqual({
-          error: "binding profile 'prod' is a profile file, which names no " +
+          error: "binding profile 'prod' is a named profile, which names no " +
               'deployment target, so there is no database to run it against',
         });
   });

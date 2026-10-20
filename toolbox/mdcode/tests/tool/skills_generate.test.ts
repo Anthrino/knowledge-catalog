@@ -154,7 +154,7 @@ actions:
         fs.readFileSync(path.join('skills', 'commerce', 'SKILL.md'), 'utf8');
     expect(skill).toContain('Store: none.');
     expect(skill).toContain(
-        "binding profile 'prod' is a profile file, which names no deployment " +
+        "binding profile 'prod' is a named profile, which names no deployment " +
         'target');
   });
 });
@@ -506,8 +506,9 @@ semantic_model:
                 [
                   '{not-json',
                   "Error: Model document 'commerce': Semantic model load " +
-                      "error: model 'commerce': the 'data' of a GOOGLE " +
-                      'custom_extensions block must be a JSON object.',
+                      "error: model 'commerce': the " +
+                      "'data' of a GOOGLE custom_extensions block must be a " +
+                      'JSON object.',
                 ],
               ]) {
            logs = [];
