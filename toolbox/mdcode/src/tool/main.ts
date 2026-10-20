@@ -4,6 +4,7 @@
 import * as cac from 'cac';
 
 import * as commands from './commands';
+import * as entryCommands from './entry_commands';
 import * as mcp from './mcp';
 
 
@@ -91,6 +92,28 @@ cli.command('push', 'Push catalog entries')
       try {
         const deployment = commands.typedDeployment(process.argv.slice(2));
         exitCode = await commands.push({...options, deployment});
+      } catch (err: any) {
+        console.error('Error:', err.message || err);
+        exitCode = 1;
+      }
+
+      process.exit(exitCode);
+    });
+
+
+cli.command(
+       'entry <action> [...names]',
+       'List or read the workspace\'s catalog entries as JSON (action: list or get)')
+    .option(
+        '--type <type>',
+        'entry list: only entries of this type, as a full type reference or its last part, such as semantic-entity')
+    .option(
+        '--content',
+        'entry list: print the full entries instead of their names and types')
+    .action(async (action, names, options) => {
+      let exitCode = 1;
+      try {
+        exitCode = await entryCommands.entry(action, names, options);
       } catch (err: any) {
         console.error('Error:', err.message || err);
         exitCode = 1;
