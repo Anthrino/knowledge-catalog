@@ -5,7 +5,10 @@
 // profile files beside it. Each Knowledge Catalog entry of the model may have
 // an overview sidecar at its entry id under the same directory:
 // `<model>.overview.md` for the model and, for example,
-// `<model>/entities/<entity>.overview.md` for an entity.
+// `<model>/entities/<entity>.overview.md` for an entity. Push reads the model
+// documents; the entry methods show the model as the entries push would write
+// for it, plus one `semantic-relationship` entry per relationship
+// (semantic/model_entries.ts).
 //
 
 import * as glob from 'glob';
@@ -15,12 +18,20 @@ import * as yaml from 'yaml';
 
 import {CatalogLayout} from '../layout';
 import * as md from '../metadata';
+import {kcV2Aspects} from '../semantic/kc_ids';
 import {modelDocumentVersion} from '../semantic/loader';
+import {documentEntries, ModelFile, ModelScope, ViewEntry} from '../semantic/model_entries';
 import {nameProblem} from '../semantic/names';
 import {YAML_OPTIONS} from '../semantic/yaml_options';
 import {deleteEachEntry, saveEachEntry} from './batch';
-
 import {joinFrontmatter, splitFrontmatter} from './documents';
+
+// The project and location of a semantic-model scope, which name the entries
+// of the entry view.
+export interface LayoutScope {
+  project: string;
+  location: string;
+}
 
 // Sidecar suffixes that are NOT model documents.
 const SIDECAR_SUFFIXES = ['.aspects.yaml', '.overview.yaml'];
@@ -63,17 +74,26 @@ function vanillaSiblingError(file: string, model: string): string {
 export class SemanticModelLayout implements CatalogLayout {
   private readonly _catalogPath: string;
   private readonly _entryGroup?: string;
+  private readonly _scope?: LayoutScope;
 
   // Maps a model handle (the document's file basename) to its absolute path.
   private readonly _index = new Map<string, string>();
 
-  constructor(catalogPath: string, entryGroup?: string) {
+  // The entry view of the model file, by bare entry ID, and the file text it
+  // was computed from.
+  private _view?: {text: string; entries: Map<string, ViewEntry>};
+
+  // `scope` names the entries of the entry view; without it, the entry
+  // methods throw once the entry group holds a model file.
+  constructor(catalogPath: string, entryGroup?: string, scope?: LayoutScope) {
     this._catalogPath = catalogPath;
     this._entryGroup = entryGroup;
+    this._scope = scope;
   }
 
   async init(): Promise<void> {
     this._index.clear();
+    this._view = undefined;
 
     if (!fs.existsSync(this._catalogPath)) {
       return;
@@ -106,22 +126,18 @@ export class SemanticModelLayout implements CatalogLayout {
     }
   }
 
-  // Consistent with listEntries(): this push-only layout exposes no per-entry
-  // Knowledge Catalog files, so no entry "exists" at the KC layer. Answering
-  // from _index (which holds model-document handles) would report an entry that
-  // listEntries() won't return and that loadEntry()/saveEntry() reject. The
-  // model documents are surfaced via modelDocuments(), not as entries.
-  entryExists(_name: string): boolean {
-    return false;
+  // The entry methods answer from the entry view: the entries push would
+  // write for the model file, named by their bare entry IDs, plus one
+  // `semantic-relationship` entry per relationship. An empty entry group has
+  // no entries. A model file that does not load fails each of them with the
+  // loader's message. Reading the model file needs the SQL parser, which the
+  // entry points load (loadSqlEngine) before they open the workspace.
+  entryExists(name: string): boolean {
+    return this._entries().has(name);
   }
 
-  // This is a push-only layout: it exposes no per-entry Knowledge Catalog
-  // files, so it lists no entries. Returning model handles here would make
-  // callers that pair listEntries() with loadEntry() -- e.g. the MCP server --
-  // list a model and then throw on read. modelDocuments() is the sole accessor
-  // for the authored model documents.
   listEntries(): string[] {
-    return [];
+    return [...this._entries().keys()];
   }
 
   // Reads the raw Ossie document text for each discovered model. This is the
@@ -488,13 +504,53 @@ export class SemanticModelLayout implements CatalogLayout {
     this._index.delete(name);
   }
 
-  // The Knowledge Catalog entry-level members are not applicable to this
-  // push-only layout; the model is authored as a single Ossie document, not as
-  // per-entry Knowledge Catalog files. These are wired when KC-resource emit
-  // and semantic-model `pull` land.
-  async loadEntry(_name: string): Promise<md.Entry> {
-    throw new Error(
-        'The SemanticModel layout does not expose per-entry Knowledge Catalog files yet.');
+  // A copy of the entry, so a caller's edits never reach the view.
+  async loadEntry(name: string): Promise<md.Entry> {
+    const found = this._entries().get(name);
+    if (!found) {
+      throw new Error(`Entry '${name}' does not exist in the semantic model.`);
+    }
+    return structuredClone(found.entry);
+  }
+
+  // The entry view, computed again only when the model file's text changes.
+  private _entries(): Map<string, ViewEntry> {
+    const file = this._modelFile();
+    if (!file) return new Map();
+    if (this._view?.text !== file.text) {
+      const entries = documentEntries(file, this._modelScope());
+      this._view = {
+        text: file.text,
+        entries: new Map(entries.map(v => [v.entry.name, v])),
+      };
+    }
+    return this._view.entries;
+  }
+
+  // The entry group's one model file, or undefined when it has none. The
+  // entry view shows one model; an entry group with more fails.
+  private _modelFile(): ModelFile|undefined {
+    if (this._index.size > 1) {
+      throw new Error(
+          `Entry group '${this._entryGroup ?? '*'}' holds ${
+              this._index.size} model files (${
+              [...this._index.keys()].sort().join(', ')}); kcmd entry ` +
+          `commands work on one model per entry group.`);
+    }
+    return this.modelDocuments()[0];
+  }
+
+  private _modelScope(): ModelScope {
+    if (!this._scope || !this._entryGroup) {
+      throw new Error(
+          'SemanticModel layout has no project, location and entry group; ' +
+          'cannot name entries.');
+    }
+    return {
+      ...this._scope,
+      entryGroup: this._entryGroup,
+      v2Aspects: kcV2Aspects(),
+    };
   }
 
   async saveEntry(_name: string, _entry: md.Entry): Promise<void> {
