@@ -16,12 +16,14 @@ import * as yaml from 'yaml';
 
 import {CatalogLayout} from '../layout';
 import * as md from '../metadata';
+import {writeFileAtomic} from '../fsutil';
 import {kcV2Aspects} from '../semantic/kc_ids';
 import {modelDocumentVersion} from '../semantic/loader';
+import {saveModelEntries} from '../semantic/model_edits';
 import {documentEntries, ModelFile, ModelScope, ViewEntry} from '../semantic/model_entries';
 import {nameProblem} from '../semantic/names';
 import {YAML_OPTIONS} from '../semantic/yaml_options';
-import {deleteEachEntry, saveEachEntry} from './batch';
+import {deleteEachEntry} from './batch';
 
 // The project and location of a semantic-model scope, which name the entries
 // of the entry view.
@@ -511,9 +513,10 @@ export class SemanticModelLayout implements CatalogLayout {
     };
   }
 
-  async saveEntry(_name: string, _entry: md.Entry): Promise<void> {
-    throw new Error(
-        'The SemanticModel layout does not support writing per-entry files yet.');
+  // Saves one entry as saveEntries does, and throws its error when it fails.
+  async saveEntry(name: string, entry: md.Entry): Promise<void> {
+    const [result] = await this.saveEntries([{...entry, name}]);
+    if (!result.ok) throw new Error(result.error);
   }
 
   async deleteEntry(_name: string): Promise<void> {
@@ -521,10 +524,23 @@ export class SemanticModelLayout implements CatalogLayout {
         'The SemanticModel layout does not support deleting per-entry files yet.');
   }
 
-  // Until this layout exposes entries, every item fails with the messages
-  // above.
+  // Saves each entry into the model file: a new element's entry is named by
+  // the element's own name, and an existing element's by its entry name
+  // (semantic/model_edits.ts). The file is written once, in place and
+  // atomically, and only when it changes. The first entry of a new model is
+  // its anchor, which creates `<model>.yaml`. A model file that does not load
+  // fails the whole call.
   async saveEntries(entries: md.Entry[]): Promise<md.EntryResult[]> {
-    return saveEachEntry(this, entries);
+    const file = this._modelFile();
+    const outcome = saveModelEntries(file, entries, this._modelScope());
+    if (outcome.text !== undefined) {
+      const target = file ? this._index.get(file.name)! :
+                            this.modelPath(outcome.model!);
+      fs.mkdirSync(path.dirname(target), {recursive: true});
+      await writeFileAtomic(target, outcome.text);
+      if (!file) this._index.set(path.basename(target, '.yaml'), target);
+    }
+    return outcome.results;
   }
 
   async deleteEntries(names: string[]): Promise<md.EntryResult[]> {

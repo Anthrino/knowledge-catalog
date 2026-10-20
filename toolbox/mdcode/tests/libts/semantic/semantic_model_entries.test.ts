@@ -1,7 +1,8 @@
 // Tests for the SemanticModel layout's entry methods
-// (src/libts/layouts/semantic-model.ts, src/libts/semantic/model_entries.ts):
-// the model file shown as the entries push would write for it, plus one
-// `semantic-relationship` entry per relationship, named by bare entry IDs.
+// (src/libts/layouts/semantic-model.ts, src/libts/semantic/model_entries.ts,
+// src/libts/semantic/model_edits.ts): the model file shown as the entries push
+// would write for it, plus one `semantic-relationship` entry per relationship,
+// named by bare entry IDs, and saves that edit the model file.
 
 import {afterEach, beforeEach, describe, expect, test} from 'bun:test';
 import * as fs from 'node:fs';
@@ -9,6 +10,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import {SemanticModelLayout} from '../../../src/libts/layouts/semantic-model';
+import {diffLines} from '../../../src/libts/semantic/text_merge';
 
 const SCOPE = {project: 'test-project', location: 'us'};
 const ORDERS_TABLE =
@@ -314,5 +316,278 @@ describe('SemanticModelLayout entry view', () => {
     const l = new SemanticModelLayout(catalogPath, 'eg');
     await l.init();
     expect(() => l.listEntries()).toThrow(/cannot name entries/);
+  });
+});
+
+// Entries for new elements, as `kcmd entry get` prints them.
+const SYS = 'dataplex-types.global';
+const ANCHOR = {
+  name: 'commerce',
+  type: `${SYS}.semantic-model`,
+  resource: {displayName: 'commerce', description: 'Orders and customers.'},
+  aspects: {[`${SYS}.guidelines`]: {instructions: 'Use for order questions.'}},
+};
+
+function entityEntry(
+    name: string, table: string, fields: string[], description?: string) {
+  return {
+    name,
+    type: `${SYS}.semantic-entity`,
+    resource: {displayName: name, ...(description ? {description} : {})},
+    aspects: {
+      [`${SYS}.semantic-entity`]: {source: {resources: [table]}},
+      [`${SYS}.schema`]: {
+        fields: fields.map(f => ({
+                             name: f,
+                             dataType: 'INT64',
+                             semantics: {expression: f},
+                           })),
+        primaryKey: {fields: [fields[0]]},
+      },
+    },
+  };
+}
+
+function metricEntry(name: string, expression: string) {
+  return {
+    name,
+    type: `${SYS}.semantic-metric`,
+    resource: {},
+    aspects: {[`${SYS}.semantic-metric`]: {expression, dataType: 'INT64'}},
+  };
+}
+
+function joinEntry(name: string, from: string, to: string, column: string) {
+  return {
+    name,
+    type: `${SYS}.semantic-relationship`,
+    resource: {},
+    aspects: {
+      [`${SYS}.semantic-relationship`]: {
+        source: {name: from, fields: [column]},
+        target: {name: to, fields: [column]},
+      },
+    },
+  };
+}
+
+const TABLES = '//bigquery.googleapis.com/projects/test-project/datasets/sales/tables';
+const ORDERS = entityEntry(
+    'orders', `${TABLES}/orders`, ['order_id', 'customer_id', 'amount'],
+    'One row per order.');
+const CUSTOMERS =
+    entityEntry('customers', `${TABLES}/customers`, ['customer_id']);
+const PRODUCTS = entityEntry('products', `${TABLES}/products`, ['product_id']);
+const REVENUE = metricEntry('revenue', 'SUM(orders.amount)');
+const ORDER_COUNT = metricEntry('order_count', 'COUNT(orders.order_id)');
+const JOIN = joinEntry('orders_to_customers', 'orders', 'customers', 'customer_id');
+
+describe('SemanticModelLayout saveEntries: new elements', () => {
+  test('creates a model in an empty entry group in one call', async () => {
+    const l = await layout();
+    expect(await l.saveEntries([ANCHOR, ORDERS, CUSTOMERS, REVENUE, JOIN]))
+        .toEqual([
+          {name: 'commerce', ok: true},
+          {name: 'commerce.entities.orders', ok: true},
+          {name: 'commerce.entities.customers', ok: true},
+          {name: 'commerce.metrics.revenue', ok: true},
+          {name: 'commerce.relationships.orders_to_customers', ok: true},
+        ]);
+    const text = fs.readFileSync(path.join(groupDir(), 'commerce.yaml'), 'utf8');
+    expect(text.startsWith('version: "0.2.0.dev0/google"\n')).toBe(true);
+
+    const reopened = await layout();
+    expect(reopened.listEntries()).toEqual([
+      'commerce',
+      'commerce.entities.orders',
+      'commerce.entities.customers',
+      'commerce.metrics.revenue',
+      'commerce.relationships.orders_to_customers',
+    ]);
+    // Each entry comes back as sent, with what the view adds.
+    const orders = await reopened.loadEntry('commerce.entities.orders');
+    expect(orders.resource).toEqual(
+        {displayName: 'orders', description: 'One row per order.', parent: 'commerce'});
+    expect(orders.aspects?.[`${SYS}.schema`].fields[0]).toEqual({
+      name: 'order_id',
+      dataType: 'INT64',
+      metadataType: 'NUMBER',
+      semantics: {expression: 'order_id', role: 'DEFAULT'},
+    });
+    expect((await reopened.loadEntry('commerce.metrics.revenue')).aspects)
+        .toEqual({
+          [`${SYS}.semantic-metric`]: {
+            entity: 'orders',
+            dataType: 'INT64',
+            expression: 'SUM(orders.amount)',
+          },
+        });
+  });
+
+  test('the anchor alone makes an anchor-only model file', async () => {
+    const l = await layout();
+    expect(await l.saveEntries([ANCHOR])).toEqual([{name: 'commerce', ok: true}]);
+    const reopened = await layout();
+    expect(reopened.listEntries()).toEqual(['commerce']);
+    expect(await reopened.saveEntries([ORDERS])).toEqual(
+        [{name: 'commerce.entities.orders', ok: true}]);
+  });
+
+  test('appends to a model and keeps the rest of the file as written', async () => {
+    const original = MODEL.replace(
+        'primary_key: [order_id]', 'primary_key: [ order_id ]  # the grain');
+    const p = writeModel(original);
+    const l = await layout();
+    expect(await l.saveEntries([PRODUCTS, ORDER_COUNT])).toEqual([
+      {name: 'commerce.entities.products', ok: true},
+      {name: 'commerce.metrics.order_count', ok: true},
+    ]);
+    const text = fs.readFileSync(p, 'utf8');
+    // Lines were only added.
+    expect(diffLines(original.split('\n'), text.split('\n'))
+               .every(h => h.start === h.end))
+        .toBe(true);
+    expect(l.listEntries()).toContain('commerce.entities.products');
+  });
+
+  test('a failed item is not written and the others are', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const results = await l.saveEntries([
+      PRODUCTS,
+      joinEntry('orders_to_suppliers', 'orders', 'suppliers', 'customer_id'),
+      ORDER_COUNT,
+    ]);
+    expect(results[0]).toEqual({name: 'commerce.entities.products', ok: true});
+    expect(results[1].ok).toBe(false);
+    expect(results[1].error).toContain("'suppliers'");
+    expect(results[2]).toEqual({name: 'commerce.metrics.order_count', ok: true});
+    const text = fs.readFileSync(p, 'utf8');
+    expect(text).toContain('name: products');
+    expect(text).toContain('name: order_count');
+    expect(text).not.toContain('orders_to_suppliers');
+  });
+
+  test('an item that needs a failed item fails too, and nothing is written',
+       async () => {
+         const p = writeModel(MODEL);
+         const before = fs.readFileSync(p, 'utf8');
+         const l = await layout();
+         const badEntity = entityEntry('suppliers', `${TABLES}/suppliers`, []);
+         const results = await l.saveEntries([
+           badEntity,
+           joinEntry('orders_to_suppliers', 'orders', 'suppliers', 'customer_id'),
+         ]);
+         expect(results.map(r => r.ok)).toEqual([false, false]);
+         expect(fs.readFileSync(p, 'utf8')).toBe(before);
+       });
+
+  test('an item that adds a push check error fails', async () => {
+    writeModel(MODEL);
+    const l = await layout();
+    const [result] = await l.saveEntries([
+      entityEntry('products', `${TABLES}/products`, ['product_id'], 'x'.repeat(2001)),
+    ]);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('2000');
+  });
+
+  test('a model that already fails a push check takes a save that does not touch it',
+       async () => {
+         writeModel(MODEL.replace(
+             'description: One row per order.',
+             `description: ${'x'.repeat(2001)}`));
+         const l = await layout();
+         expect(await l.saveEntries([PRODUCTS])).toEqual(
+             [{name: 'commerce.entities.products', ok: true}]);
+       });
+
+  test('an element that would not come back as sent fails, naming the value',
+       async () => {
+         writeModel(MODEL);
+         const l = await layout();
+         const typo = structuredClone(PRODUCTS);
+         typo.aspects[`${SYS}.schema`].fields[0].dataType = 'INTEGER';
+         const extra = structuredClone(PRODUCTS) as any;
+         extra.name = extra.resource.displayName = 'items';
+         extra.aspects[`${SYS}.overview`] = {content: 'hello'};
+         const results = await l.saveEntries([typo, extra]);
+         expect(results[0].error).toBe(
+             `aspects.${SYS}.schema.fields[0].dataType: "INTEGER" would be ` +
+             'saved as "STRING"');
+         expect(results[1].error).toBe(
+             `aspects.${SYS}.overview: {"content":"hello"} would be saved as nothing`);
+       });
+
+  test('a name that is not an entry and not an element name fails', async () => {
+    writeModel(MODEL);
+    const l = await layout();
+    const [dotted, invalid] = await l.saveEntries([
+      {...PRODUCTS, name: 'commerce.entities.products'},
+      {...PRODUCTS, name: 'my-products', resource: {}},
+    ]);
+    expect(dotted.error).toContain('is not an entry of the model');
+    expect(invalid.error).toContain("Entity name 'my-products' is not valid");
+  });
+
+  test('an existing element, a second model and a child before its anchor fail',
+       async () => {
+         writeModel(MODEL);
+         const l = await layout();
+         const [twin, second] = await l.saveEntries([
+           {...ORDERS, name: 'customers', resource: {displayName: 'customers'}},
+           {...ANCHOR, name: 'other', resource: {displayName: 'other'}},
+         ]);
+         expect(twin.error).toBe("model 'commerce' already has entity 'customers'");
+         expect(second.error).toContain("already holds model 'commerce'");
+
+         fs.rmSync(groupDir(), {recursive: true});
+         const empty = await layout();
+         const [orphan] = await empty.saveEntries([ORDERS]);
+         expect(orphan.error).toContain("save the model's anchor entry");
+       });
+
+  test('a renaming display name, an action and an update fail', async () => {
+    writeModel(MODEL);
+    const l = await layout();
+    const results = await l.saveEntries([
+      {...PRODUCTS, resource: {displayName: 'items'}},
+      {name: 'refund', type: 'test-project.global.semantic-action', resource: {}},
+      await l.loadEntry('commerce.entities.orders'),
+    ]);
+    expect(results[0].error).toContain('renaming is not supported');
+    expect(results[1].error).toContain('semantic-action entries is not supported');
+    expect(results[2].error).toContain('not supported yet');
+  });
+
+  test('names created entries with the second-generation layout', async () => {
+    process.env.KC_V2_ASPECTS = '1';
+    writeModel(MODEL);
+    const l = await layout();
+    expect(await l.saveEntries([PRODUCTS])).toEqual(
+        [{name: 'commerce/entities/products', ok: true}]);
+  });
+
+  test('appends an entity to a vanilla model file under datasets', async () => {
+    const p = writeModel(`version: "0.2.0.dev0"
+semantic_model:
+  - name: commerce
+    datasets:
+      - name: orders
+        source: ${ORDERS_TABLE}
+        primary_key: [order_id]
+        fields:
+          - name: order_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: order_id
+`);
+    const l = await layout();
+    expect(await l.saveEntries([PRODUCTS])).toEqual(
+        [{name: 'commerce.entities.products', ok: true}]);
+    const text = fs.readFileSync(p, 'utf8');
+    expect(text).not.toContain('entities:');
+    expect(text).toContain('      - name: products');
   });
 });
