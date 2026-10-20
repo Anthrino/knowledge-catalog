@@ -122,6 +122,18 @@ export class Namer {
   }
 
   /**
+   * Bare entry ID for a relationship's `semantic-relationship` entry (mapping
+   * Addendum 6): `<model>/relationships/<relationship>` with the second-
+   * generation layout, and the form entityId uses otherwise. Push does not
+   * write relationship entries yet; kcmd's local entry view names them.
+   */
+  relationshipId(model: SemanticModel, rel: Relationship): string {
+    return this.v2Aspects ?
+        `${model.name}/relationships/${rel.name}` :
+        `${slug(model.name)}.relationships.${slug(rel.name)}`;
+  }
+
+  /**
    * Entry link IDs are more restricted than entry IDs: lowercase letters,
    * numbers and hyphens only, starting with a letter (see `linkSlug`). Does not
    * branch on `v2Aspects`.
