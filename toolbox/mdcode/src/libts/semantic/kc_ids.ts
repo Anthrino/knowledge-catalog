@@ -23,6 +23,13 @@ import {Entity, Metric, Relationship, SemanticModel} from './ir';
 export const DEFAULT_TYPE_PROJECT = 'dataplex-types';
 export const DEFAULT_TYPE_LOCATION = 'global';
 
+// Whether Knowledge Catalog push and pull should use the second-generation
+// built-in aspect fields and entry-id layout. Only `KC_V2_ASPECTS=1` enables
+// it; unset, `''`, `'0'`, and `'true'` are all off.
+export function kcV2Aspects(): boolean {
+  return process.env.KC_V2_ASPECTS === '1';
+}
+
 // Matches the container path and trailing bare ID of any Knowledge Catalog
 // resource name:
 // - Entry-group paths (`ENTRY_GROUP_PATH_RE`):
