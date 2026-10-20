@@ -19,7 +19,7 @@ import * as deploySpannerLeg from '../libts/semantic/deploy_spanner';
 import {googleBlockTargets, googleDeploymentTargets} from '../libts/semantic/deployment_target';
 import {SemanticModel} from '../libts/semantic/ir';
 import {FILE_COPY_TYPE_ID, FileCopy, provisionCustomTypes} from '../libts/semantic/kc_custom_types';
-import {asResourceUri, deploymentProfileError, LoadedModel, loadSemanticModels} from '../libts/semantic/loader';
+import {asResourceUri, deploymentProfileError, LoadedModel, loadSemanticModels, setsAKeyTwice} from '../libts/semantic/loader';
 import {serializeModel} from '../libts/semantic/osi_converter';
 import * as pullKc from '../libts/semantic/pull_kc';
 import {applyProfileExclusions, AvailabilityReport, DEFAULT_PROFILE, DocumentProfile, isProfileFileForm, modelFileAloneMessage, ProfileExclusion, profileForDocument, profileSourceMessage, pruneUnavailable, reservedProfileNameError, unknownProfileMessage,} from '../libts/semantic/resolve_profiles';
@@ -154,13 +154,16 @@ export function checkPushSelection(sel: {
 
 // Whether a model document's text declares a graph deployment target, without
 // a full strict load. True when the model names one via the `deployments:` list
-// (or the legacy `deployment_target:` key) or a GOOGLE custom_extension
-// `deploymentTargets`. Drives the push mode: a push whose models all declare no
-// target governs the logical model only -- it deploys no graph, so bindings and
-// a target are not required and pruning is skipped (Knowledge Catalog publishes
-// the whole model). On any ambiguity (unparseable YAML, malformed GOOGLE data)
-// it returns true, so the strict load reports the problem rather than silently
-// taking the logical path.
+// (or the legacy `deployment_target:` key), or a GOOGLE custom_extension
+// `deployments` or `deploymentTargets` list. Drives the push mode: a push whose
+// models all declare no target governs the logical model only -- it deploys no
+// graph, so bindings and a target are not required and pruning is skipped
+// (Knowledge Catalog publishes the whole model). It also returns true when the
+// YAML does not parse, or when the data string of a GOOGLE block on the model
+// is not a JSON object, sets a key twice, or holds a `deployments` or
+// `deploymentTargets` value that is not a list. The strict load then reports the problem, and the push
+// does not silently take the logical path. A block whose data is not a string
+// is skipped, and the load rejects it.
 export function declaresGraphTarget(text: string): boolean {
   let doc: any;
   try {
@@ -185,13 +188,31 @@ export function declaresGraphTarget(text: string): boolean {
       // The rule every other reader uses: a blank target names nothing, and
       // a non-string one is a target in no accepted form, which the target
       // checks reject.
+      let data: unknown;
       try {
         if (googleBlockTargets([{vendorName: 'GOOGLE', data: ext.data}], '')
                 .length) {
           return true;
         }
+        data = JSON.parse(ext.data);
       } catch {
         return true;  // malformed GOOGLE data: strict load will name it
+      }
+      if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+        return true;  // not a JSON object: strict load will name it
+      }
+      // JSON.parse keeps the last of a repeated key, so an earlier value may
+      // list a target. The strict load rejects the repeat.
+      if (setsAKeyTwice(ext.data)) return true;
+      const {deployments, deploymentTargets} =
+          data as {deployments?: unknown; deploymentTargets?: unknown};
+      if (deploymentTargets !== undefined &&
+          !Array.isArray(deploymentTargets)) {
+        return true;
+      }
+      if (Array.isArray(deployments) ? deployments.length > 0 :
+                                       deployments !== undefined) {
+        return true;
       }
     }
   }

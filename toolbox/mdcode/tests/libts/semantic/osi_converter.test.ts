@@ -41,7 +41,6 @@ describe('loader <-> serialize round trip is IR-stable', () => {
     'vendor_dialects.yaml',
     'sales_bq_graph_target.yaml',
     'actions_place_order.yaml',
-    'tpcds_retail.yaml',
     'lineitem_databricks_ext.yaml',
   ];
 
@@ -58,6 +57,31 @@ describe('loader <-> serialize round trip is IR-stable', () => {
       }
     });
   }
+
+  // The loader reads a vanilla metric's anchor out of its GOOGLE block, and a
+  // '0.2.0.dev0' write does not put it back in one yet. Two metrics in this
+  // fixture are anchored in a GOOGLE block, and each reads two datasets. The
+  // reload cannot infer one entity for them, so each comes back with none.
+  // The write warns once for each, and everything else survives.
+  test('tpcds_retail.yaml survives IR -> YAML -> IR apart from its GOOGLE block anchors', () => {
+    const [model] = loadFixture('tpcds_retail.yaml');
+    const anchored = model.metrics.filter(m => m.authoredEntity !== undefined);
+    expect(anchored.map(m => m.name)).toEqual(['customer_lifetime_value', 'store_productivity']);
+
+    const {yaml: text, warnings} = serializeModel(model);
+    const reloaded = loadModels(text, {allowLegacyBareSource: true}).models;
+    const unanchored = model.metrics.map(m => {
+      const copy = {...m};
+      if (copy.authoredEntity !== undefined) {
+        delete copy.authoredEntity;
+        delete copy.entity;
+      }
+      return copy;
+    });
+    expect(reloaded).toEqual([{...model, metrics: unanchored}]);
+    expect(warnings).toEqual(anchored.map(({name}) =>
+        `metric '${name}': 'entity' has no representation under '0.2.0.dev0' and is not serialized`));
+  });
 });
 
 
@@ -1117,6 +1141,7 @@ describe('dual-version model serialization', () => {
       ...emptyModel,
       version: '0.2.0.dev0',
       deployments: [{name: 'prod', target: 'bigquery:p.d'}],
+      profiles: [{name: 'prod', entities: [], relationships: []}],
       entities: [{...baseOrders, extends: ['base']}],
       relationships: [{
         name: 'rel',
@@ -1145,12 +1170,44 @@ describe('dual-version model serialization', () => {
 
     expect(warnings).toEqual([
       `model 'm': 'deployments' has no representation under '0.2.0.dev0' and is not serialized`,
+      `model 'm': 'profiles' has no representation under '0.2.0.dev0' and is not serialized`,
       `model 'm': 'actions' has no representation under '0.2.0.dev0' and is not serialized`,
       `model 'm': 'constraints' has no representation under '0.2.0.dev0' and is not serialized`,
       `entity 'orders': 'extends' has no representation under '0.2.0.dev0' and is not serialized`,
       `relationship 'rel': 'description' has no representation under '0.2.0.dev0' and is not serialized`,
       `metric 'total': 'entity' has no representation under '0.2.0.dev0' and is not serialized`,
     ]);
+  });
+
+  // A GOOGLE block the model keeps, such as one that lists deploymentTargets,
+  // is written as it is, with any profiles in it.
+  test('does not warn about profiles in a GOOGLE block the model keeps under 0.2.0.dev0', () => {
+    const block = (data: object) =>
+        `      - vendor_name: GOOGLE\n        data: '${JSON.stringify(data)}'\n`;
+    const text = (blocks: string) => `version: "0.2.0.dev0"
+semantic_model:
+  - name: m
+    custom_extensions:
+${blocks}    datasets:
+      - name: orders
+        source: bigquery:p.d.orders
+        primary_key: [id]
+        fields:
+          - name: id
+            expression: {dialects: [{dialect: ANSI_SQL, expression: id}]}
+`;
+    const target = 'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+    const prod = {name: 'prod'};
+    const warning =
+        `model 'm': 'profiles' has no representation under '0.2.0.dev0' and is not serialized`;
+
+    const [kept] = loadModels(text(block({deploymentTargets: [target], profiles: [prod]}))).models;
+    const written = serializeModel(kept);
+    expect(written.warnings).not.toContain(warning);
+    expect(loadModels(written.yaml).models[0].profiles).toEqual(kept.profiles);
+
+    const [own] = loadModels(text(block({deploymentTargets: [target]}) + block({profiles: [prod]}))).models;
+    expect(serializeModel(own).warnings).toContain(warning);
   });
 
   test('warns that abstract is dropped under 0.2.0.dev0', () => {
