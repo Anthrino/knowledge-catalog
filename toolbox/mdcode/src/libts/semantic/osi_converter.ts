@@ -433,7 +433,7 @@ function warnGoogleOnlyContent(model: SemanticModel, warnings: string[]): void {
   }
 }
 
-function datasetDoc(
+export function datasetDoc(
     entity: Entity, warnings: string[], logical: boolean,
     version: FormatVersion): Record<string, any> {
   const isGoogleVersion = version === GOOGLE_VERSION;
@@ -503,7 +503,7 @@ function datatypeDoc<T extends string>(type: T|undefined): Exclude<T, 'Opaque'>|
                                                    type as Exclude<T, 'Opaque'>;
 }
 
-function fieldDoc(
+export function fieldDoc(
     field: Field, warnings: string[], logical: boolean,
     isGoogleVersion: boolean): Record<string, any> {
   const expression =
@@ -534,8 +534,9 @@ function fieldDoc(
   });
 }
 
-function metricDoc(metric: Metric, warnings: string[], version: FormatVersion):
-    Record<string, any> {
+export function metricDoc(
+    metric: Metric, warnings: string[],
+    version: FormatVersion): Record<string, any> {
   const isGoogleVersion = version === GOOGLE_VERSION;
   const placement = FORMAT_VERSION_PLACEMENT[version];
   // Emit `entity` only from `authoredEntity` (natively under GOOGLE_VERSION or
@@ -737,7 +738,7 @@ function executorDoc(ex: Executor): Record<string, any> {
 // `from_columns`/`to_columns` are their positional join columns. An association
 // (junction-table) edge has no open-format syntax, so only this direct-FK view
 // is emitted and the junction detail is flagged.
-function relationshipDoc(
+export function relationshipDoc(
     rel: Relationship, warnings: string[],
     version: FormatVersion): Record<string, any> {
   const isGoogleVersion = version === GOOGLE_VERSION;
@@ -780,7 +781,7 @@ function relationshipDoc(
 //   1. YAML loaded by `loader.ts`, which populates `dialects` and `stringForm`.
 //   2. Models built by `kcmd pull` or OWL import, which leave `dialects` unset
 //      and only populate `expression` (plus optional `importedExpression`).
-function expressionDoc(
+export function expressionDoc(
     item: {
       expression?: string;
       importedExpression?: string;
@@ -866,7 +867,7 @@ function dimensionDoc(field: Field): Record<string, any>|undefined {
 // Emits the structured `ai_context` for the target version, inverting
 // loader.normalizeAiContext. Custom properties (`additionalProperties`) sit
 // under `custom:` under GOOGLE_VERSION and as sibling keys under OSSIE_VERSION.
-function aiContextDoc(ai: AiContext|undefined, isGoogleVersion: boolean):
+export function aiContextDoc(ai: AiContext|undefined, isGoogleVersion: boolean):
     Record<string, unknown>|undefined {
   if (!ai) return undefined;
   const custom =

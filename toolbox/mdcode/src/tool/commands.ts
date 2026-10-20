@@ -19,6 +19,7 @@ import * as deploySpannerLeg from '../libts/semantic/deploy_spanner';
 import {googleBlockTargets, googleDeploymentTargets, unnamedDeployments} from '../libts/semantic/deployment_target';
 import {ProfileSpec, SemanticModel} from '../libts/semantic/ir';
 import {FILE_COPY_TYPE_ID, FileCopy, provisionCustomTypes} from '../libts/semantic/kc_custom_types';
+import {kcV2Aspects} from '../libts/semantic/kc_ids';
 import {asResourceUri, deploymentProfileError, LoadedModel, loadSemanticModels, SemanticModelError, setsAKeyTwice} from '../libts/semantic/loader';
 import {serializeModel} from '../libts/semantic/osi_converter';
 import * as pullKc from '../libts/semantic/pull_kc';
@@ -44,11 +45,9 @@ export interface InitOptions {
 
 
 // Whether Knowledge Catalog push and pull should use the second-generation
-// built-in aspect fields and entry-id layout. Only `KC_V2_ASPECTS=1` enables
-// it; unset, `''`, `'0'`, and `'true'` are all off.
-export function kcV2Aspects(): boolean {
-  return process.env.KC_V2_ASPECTS === '1';
-}
+// built-in aspect fields and entry-id layout. It lives in kc_ids.ts, so that
+// the semantic-model layout reads the same switch.
+export {kcV2Aspects};
 
 
 // What a model would deploy through the Knowledge Catalog leg alone. Named
