@@ -233,8 +233,8 @@ function docReads(
 
 // `f`'s expression as a document writes it: its string form or its dialect
 // list. A binding built in memory with no dialect list gives its imported
-// text as an entry of its imported dialect, which is how the graph generators
-// read it. When it also has a target text, that text is a BIGQUERY entry
+// text as an entry of its imported dialect, which is how the Spanner generator
+// reads it. When it also has a target text, that text is a BIGQUERY entry
 // beside it, as serializeModel writes the two. A target text alone is the
 // string form. So is a target text beside an imported text that a dialect
 // list cannot hold: one with no imported dialect, or one marked BIGQUERY,
@@ -268,7 +268,7 @@ export function expressionDocOf(
 // a document writes it, as expressionDocOf gives it. Then its target text is
 // read as BigQuery, and its imported text in its imported dialect, or as
 // BigQuery with none, unless that reading already read or named it. The
-// graph generators read each text in that dialect when they write it, and
+// Spanner generator reads each text in that dialect when it writes it, and
 // serializeModel writes both. Either text can be outside the dialect list
 // when the field or metric was built in memory, or when push filled
 // `expression` by transpiling. The problem names each text that holds no

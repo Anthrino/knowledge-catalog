@@ -14,15 +14,16 @@
 //      `MEASURE(...)`; Spanner Graph has none).
 //   3. Element metadata. The per-element `OPTIONS` clause carrying
 //      descriptions and synonyms (BigQuery has one; Spanner has none).
-//   4. SQL text. Which of a field's expressions the engine reads.
+//   4. SQL text. Which SQL a field binds to: the engine's own dialect entry
+//      (`BIGQUERY` or `SPANNER`), falling back to the `ANSI_SQL` one.
 //
 // ./bigquery supplies the BigQuery engine; spanner.ts still writes its own
 // graph.
 //
 
-import {AiContext, Association, Entity, Field, Metric, Relationship, SemanticModel,} from './ir';
+import {AiContext, Association, Entity, Field, isFieldBound, Metric, Relationship, SemanticModel, SqlDialect,} from './ir';
 import {resolveInheritance} from './resolve_inheritance';
-import {stripQualifier} from './sql_expr_utils';
+import {fieldBindingWithoutComments, stripQualifier} from './sql_expr_utils';
 import {isSimpleIdentifier, quoteIfReserved} from './sql_identifiers';
 
 export interface GenerateResult {
@@ -69,8 +70,9 @@ export interface GraphEngine {
       string|undefined;
   fieldOptions(field: Field): string|undefined;
 
-  // 4. SQL text. The SQL a field binds to on this engine, or undefined when the
-  // engine has none for it.
+  // 4. SQL text. The engine's dialect, as warnings name it, and the SQL a field
+  // binds to on this engine, or undefined when the engine has none for it.
+  dialect: SqlDialect;
   fieldExpression(field: Field): string|undefined;
 }
 
@@ -216,10 +218,24 @@ export function generateGraphDdl(
       new Map(entities.filter(e => e.abstract || !skipped.has(e.name))
                   .map(e => [e.name, e]));
 
+  // A field one node table leaves out because this engine has no SQL for it
+  // is left out of each abstract ancestor's label on every table too, so the
+  // label lists the same properties everywhere it appears.
+  const leftOutUnder = new Map<string, Set<string>>();
+  for (const e of validEntities) {
+    for (const f of e.fields) {
+      if (!isFieldBound(f) || engine.fieldExpression(f) !== undefined) continue;
+      for (const a of e.extends ?? []) {
+        leftOutUnder.set(a, (leftOutUnder.get(a) ?? new Set()).add(f.name));
+      }
+    }
+  }
+
   const nodeTables = validEntities.map(
       entity => renderNodeTable(
           entity, measurePropertiesByEntity.get(entity.name) ?? [],
-          labelByName, ancestorsUsed.has(entity.name), engine, warnings));
+          labelByName, leftOutUnder, ancestorsUsed.has(entity.name), engine,
+          warnings));
 
   const entitiesByName = new Map(validEntities.map(e => [e.name, e]));
   const edgeTables =
@@ -257,7 +273,8 @@ export function generateGraphDdl(
 
 function renderNodeTable(
     entity: Entity, measureProperties: string[],
-    labelByName: Map<string, Entity>, isSupertype: boolean,
+    labelByName: Map<string, Entity>,
+    leftOutUnder: Map<string, Set<string>>, isSupertype: boolean,
     engine: GraphEngine, warnings: string[]): string {
   const table =
       engine.table(entity.dataSource, warnings, `entity '${entity.name}'`);
@@ -282,6 +299,9 @@ function renderNodeTable(
     // straight from this table. A concrete ancestor keeps its authority.
     if (!ancestor || ancestor.abstract) continue;
     for (const f of ancestor.fields) {
+      // The ancestor's node table leaves out a field this engine has no SQL
+      // for, so there is no rendering to defer to.
+      if (engine.fieldExpression(f) === undefined) continue;
       if (!inheritedRender.has(f.name)) {
         inheritedRender.set(
             f.name, renderFieldProperty(f, ancestor.name, engine));
@@ -327,21 +347,28 @@ function renderNodeTable(
   // Order: declared fields, then the engine's measure properties (any operand
   // properties synthesized for measures, then the measures themselves, which
   // reference those operand properties).
-  // Defense in depth: availability pruning normally strips every unbound field
-  // (it has no column) before generation. Pruning tests isFieldBound. The
-  // BigQuery engine's fieldExpression returns undefined exactly when
-  // fieldBinding does, so the two agree on which fields are bound. The text it
-  // returns is fieldBinding's with the comments removed. But a caller that
-  // generates DDL straight from a bindingOptional load without pruning could
-  // still reach here with an unbound field, such as a purely logical one. Skip
-  // it with a warning rather than emit `<name>` as a phantom bare column the
-  // source table does not have.
+  // A field is kept when the engine has SQL for it. That is narrower than
+  // isFieldBound, which availability pruning tests: a field bound only by
+  // another engine's SQL is bound, yet this engine has nothing to emit for it.
+  // Skip such a field with a warning naming the engine's dialect rather than
+  // emit that other engine's SQL. A field with no SQL at all is unbound;
+  // pruning normally strips it before generation, but a caller that generates
+  // DDL straight from a bindingOptional load without pruning could still reach
+  // here with one, such as a purely logical field. Skip it too rather than emit
+  // `<name>` as a phantom bare column the source table does not have.
   const boundFields = entity.fields.filter(f => {
     if (engine.fieldExpression(f) !== undefined) return true;
     warnings.push(
-        `entity '${entity.name}': field '${f.name}' has no column under this ` +
-        `binding; omitted from the node table (bind it, or govern the logical ` +
-        `model in Knowledge Catalog instead)`);
+        isFieldBound(f) ?
+            `entity '${entity.name}': field '${f.name}' has no '${
+                engine.dialect}' or 'ANSI_SQL' expression; omitted from the ` +
+                (inheritedRender.has(f.name) ?
+                     `node table's own label, and the supertype's label keeps ` +
+                         `the supertype's definition` :
+                     `node table`) :
+            `entity '${entity.name}': field '${f.name}' has no column under ` +
+                `this binding; omitted from the node table (bind it, or ` +
+                `govern the logical model in Knowledge Catalog instead)`);
     return false;
   });
   const properties = [...boundFields.map(renderOwn), ...measureProperties];
@@ -423,15 +450,28 @@ function renderNodeTable(
       // fields); a profile that binds the subtype but not an inherited field
       // simply does not expose that property under the shared label.
       signature = [];
+      let leftOut = false;
       for (const af of ancestor.fields) {
+        if (leftOutUnder.get(ancestorName)?.has(af.name)) {
+          leftOut = true;
+          continue;
+        }
         const child = boundFields.find(cf => cf.name === af.name);
         if (child) {
           signature.push(renderFieldProperty(child, entity.name, engine));
         }
       }
+      // A bare LABEL exposes every column of its table, so a label that a
+      // left-out field empties lists no properties instead.
+      if (!signature.length && leftOut) {
+        lines.push(line(2, 'NO PROPERTIES'));
+        continue;
+      }
     } else {
-      signature = ancestor.fields.map(
-          f => renderFieldProperty(f, ancestor.name, engine));
+      // Only the fields the ancestor's own node table lists.
+      signature =
+          ancestor.fields.filter(f => engine.fieldExpression(f) !== undefined)
+              .map(f => renderFieldProperty(f, ancestor.name, engine));
     }
     if (signature.length) lines.push(propertiesBlock(signature));
   }
@@ -483,7 +523,10 @@ function physicalColumn(
     entity: Entity|undefined, fieldName: string, engine: GraphEngine): string {
   const field = entity?.fields.find(f => f.name === fieldName);
   if (entity === undefined || field === undefined) return fieldName;
-  const expr = engine.fieldExpression(field);
+  // A key or join column names a column, and a bare column name reads the same
+  // in every dialect, so a field with no SQL for this engine still gives it.
+  const expr =
+      engine.fieldExpression(field) ?? fieldBindingWithoutComments(field);
   return expr !== undefined ? stripQualifier(expr, entity.name) : fieldName;
 }
 
@@ -628,8 +671,19 @@ function renderAssociationEdge(
   if (labelOpts) lines.push(line(2, labelOpts));
 
   // The junction's own non-key fields are the edge's properties.
-  const properties = (assoc.fields ?? [])
-                         .map(f => renderFieldProperty(f, rel.name, engine));
+  const properties =
+      (assoc.fields ?? [])
+          .filter(f => {
+            if (engine.fieldExpression(f) !== undefined || !isFieldBound(f)) {
+              return true;
+            }
+            warnings.push(
+                `relationship '${rel.name}': field '${f.name}' has no '${
+                    engine.dialect}' or 'ANSI_SQL' expression; omitted from ` +
+                `the edge table`);
+            return false;
+          })
+          .map(f => renderFieldProperty(f, rel.name, engine));
   if (properties.length) lines.push(propertiesBlock(properties));
 
   return lines.join('\n');

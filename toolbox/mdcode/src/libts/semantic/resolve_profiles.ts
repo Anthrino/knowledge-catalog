@@ -647,7 +647,7 @@ export interface AvailabilityReport {
  * no executor dropped. A field counts whether the entity declares or inherits
  * it. What a field or metric reads comes from the text `dialect` evaluates,
  * which defaults to the dialect the model's sources imply, and from the text
- * the graph generators emit (see prunedTexts). When the sources are in
+ * the Spanner graph generator emits (see prunedTexts). When the sources are in
  * systems of different dialects, or one names no system, there is no dialect
  * and every text counts.
  * The input is never mutated. The report names each dropped block
@@ -671,9 +671,11 @@ export function pruneUnavailable(
   };
 
   // A field is bound when isFieldBound says so; otherwise it is unbound
-  // (structurally absent under this profile). isFieldBound is the shared
-  // predicate the generator also uses, so a field awaiting transpilation (its
-  // column carried on the imported expression) counts as bound, not dropped.
+  // (structurally absent under this profile). A field awaiting transpilation
+  // (its column carried on the imported expression) or bound only through a
+  // dialect list counts as bound, not dropped. The graph generators ask a
+  // narrower question, whether the field has SQL for their engine, and leave
+  // out a bound field that has none with a warning of their own.
   //
   // Availability is judged on each entity's resolved fields, declared plus
   // inherited, since a metric can read an inherited field as readily as a
@@ -1459,7 +1461,7 @@ function profileStructureErrors(profile: ProfileSpec): string[] {
     if (dupField) errors.push(`${where} 'fields' lists '${dupField}' twice`);
     for (const pf of pe.fields ?? []) {
       const fat = `${where}: field '${pf.name}'`;
-      if (!pf.dialects?.length && !isFieldBound(pf as Field)) {
+      if (!isFieldBound(pf as Field)) {
         errors.push(
             `${fat} has no 'expression'; bind it with one, or list it in ` +
             `'fields_exclude'`);
@@ -1574,7 +1576,7 @@ function applyBindings(
       // An entry with nothing to bind leaves the field as it is. applyProfile
       // rejects one, and validateProfileCompleteness reports it, through
       // profileStructureErrors.
-      if (!pf.dialects?.length && !isFieldBound(pf as Field)) continue;
+      if (!isFieldBound(pf as Field)) continue;
       // Read as a load reads the same expression in a model file. One the
       // reader rejects is left unapplied, also when a profile built in memory
       // gives it with no dialect list. Under `noSqlAsWritten`, one the reader
@@ -1901,10 +1903,11 @@ function evaluatedTexts(
 }
 
 // The texts pruning reads: those a profile of `dialect` evaluates, and the text
-// the graph generators emit today, which is `fieldBinding` whatever the
+// the Spanner graph generator emits today, which is `fieldBinding` whatever the
 // engine. Reading both keeps a deployed graph from reading a field the profile
-// leaves unbound. Once each generator emits its own engine's text, the
-// emitted text adds nothing and this can read `textsFor` alone.
+// leaves unbound. The BigQuery generator already emits its own engine's text;
+// once Spanner does too, the emitted text adds nothing and this can read
+// `textsFor` alone.
 function prunedTexts(
     f: Pick<
         Field,
