@@ -17,6 +17,7 @@ import * as md from '../metadata';
 import {modelDocumentVersion} from '../semantic/loader';
 import {nameProblem} from '../semantic/names';
 import {YAML_OPTIONS} from '../semantic/yaml_options';
+import {deleteEachEntry, saveEachEntry} from './batch';
 
 // Sidecar suffixes that are NOT model documents.
 const SIDECAR_SUFFIXES = ['.aspects.yaml', '.overview.yaml'];
@@ -462,6 +463,16 @@ export class SemanticModelLayout implements CatalogLayout {
   async deleteEntry(_name: string): Promise<void> {
     throw new Error(
         'The SemanticModel layout does not support deleting per-entry files yet.');
+  }
+
+  // Until this layout exposes entries, every item fails with the messages
+  // above.
+  async saveEntries(entries: md.Entry[]): Promise<md.EntryResult[]> {
+    return saveEachEntry(this, entries);
+  }
+
+  async deleteEntries(names: string[]): Promise<md.EntryResult[]> {
+    return deleteEachEntry(this, names);
   }
 }
 

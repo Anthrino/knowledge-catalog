@@ -24,3 +24,13 @@ export interface Entry {
   };
   aspects?: Record<string, Aspect>;
 }
+
+// The outcome of one item of a call that saves or deletes several entries.
+// Results come in the order of the items. `name` is the name the item used,
+// or, for an entry the call created, the name the layout gave it; `error`
+// says why an item failed and is absent when it succeeded.
+export interface EntryResult {
+  name: string;
+  ok: boolean;
+  error?: string;
+}
