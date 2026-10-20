@@ -8,6 +8,7 @@ import * as yaml from 'yaml';
 import * as md from '../metadata';
 import { pathInside, readFileIfExists, writeFileAtomic } from '../fsutil';
 import { CatalogLayout } from '../layout';
+import { deleteEachEntry, saveEachEntry } from './batch';
 
 const DEFAULT_ENTRY_TYPE = 'dataplex-types.global.generic';
 const INDEX_NAME = 'index';
@@ -141,6 +142,14 @@ export class DocumentsLayout implements CatalogLayout {
     await fs.promises.unlink(entryPath);
     this._index.delete(name);
     this._synthesizeIndexEntries();
+  }
+
+  async saveEntries(entries: md.Entry[]): Promise<md.EntryResult[]> {
+    return saveEachEntry(this, entries);
+  }
+
+  async deleteEntries(names: string[]): Promise<md.EntryResult[]> {
+    return deleteEachEntry(this, names);
   }
 
   // Ensure every directory that contains entries has an index entry. Directories

@@ -9,6 +9,7 @@ import * as yaml from 'yaml';
 import { pathInside, readFileIfExists, writeFileAtomic } from '../fsutil';
 import { CatalogLayout } from '../layout';
 import * as md from '../metadata';
+import { deleteEachEntry, saveEachEntry } from './batch';
 
 
 export class StandardLayout implements CatalogLayout {
@@ -100,6 +101,14 @@ export class StandardLayout implements CatalogLayout {
 
     await fs.promises.unlink(entryPath);
     this._index.delete(name);
+  }
+
+  async saveEntries(entries: md.Entry[]): Promise<md.EntryResult[]> {
+    return saveEachEntry(this, entries);
+  }
+
+  async deleteEntries(names: string[]): Promise<md.EntryResult[]> {
+    return deleteEachEntry(this, names);
   }
 }
 
