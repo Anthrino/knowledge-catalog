@@ -96,18 +96,23 @@ cli.command('push', 'Push catalog entries')
 
 
 cli.command(
-       'entry <action> [...names]',
-       'List or read the workspace\'s catalog entries as JSON (action: list or get)')
+       'entry <action> [...args]',
+       'List, read, save or delete the workspace\'s catalog entries as JSON (action: list, get <name...>, save <file|->, delete <name...>)')
     .option(
         '--type <type>',
         'entry list: only entries of this type, as a full type reference or its last part, such as semantic-entity')
     .option(
         '--content',
         'entry list: print the full entries instead of their names and types')
-    .action(async (action, names, options) => {
+    .action(async (action, args, options) => {
       let exitCode = 1;
       try {
-        exitCode = await entryCommands.entry(action, names, options);
+        // cac drops a lone `-`, the usual name for standard input, so look for
+        // it among the words typed after `entry save`.
+        if (action === 'save' && !args.length && typedStdinDash()) {
+          args = ['-'];
+        }
+        exitCode = await entryCommands.entry(action, args, options);
       } catch (err: any) {
         console.error('Error:', err.message || err);
         exitCode = 1;
@@ -253,4 +258,11 @@ if (!cli.matchedCommand) {
   // second copy of it under the error reads as two separate answers.
   if (!cli.options.help) cli.outputHelp();
   process.exit(1);
+}
+
+// Whether the caller typed `kcmd entry save -`.
+function typedStdinDash(): boolean {
+  const words = process.argv.slice(2);
+  const at = words.indexOf('entry');
+  return at >= 0 && words[at + 1] === 'save' && words.slice(at + 2).includes('-');
 }
