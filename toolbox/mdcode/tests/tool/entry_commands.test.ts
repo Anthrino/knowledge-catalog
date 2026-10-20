@@ -393,10 +393,11 @@ describe('kcmd entry save, as a process', () => {
       stdout: 'pipe',
       stderr: 'pipe',
     });
-    expect(p.exitCode).toBe(1);
-    const results = JSON.parse(p.stdout.toString());
-    expect(results).toHaveLength(1);
-    expect(results[0].name).toBe('refunds');
-    expect(results[0].ok).toBe(false);
+    expect(p.exitCode).toBe(0);
+    expect(JSON.parse(p.stdout.toString()))
+        .toEqual([{name: 'commerce.entities.refunds', ok: true}]);
+    const model = fs.readFileSync(
+        path.join('catalog', 'EntryGroups', 'commerce_eg', 'commerce.yaml'), 'utf8');
+    expect(model).toContain('- name: refunds');
   }, 30000);
 });
