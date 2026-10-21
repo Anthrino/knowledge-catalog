@@ -6,19 +6,49 @@
 // showing the exact generated DDL and warnings. Prefer adding a fixture +
 // golden there.
 //
-// This file holds only what a loader fixture CANNOT express: an M:N association
+// This file holds what a loader fixture CANNOT express: an M:N association
 // edge (the open format has no association-table syntax, so its IR is
 // hand-built and checked against a committed golden), and degenerate/negative
 // inputs and pure GenerateOptions behavior (graph naming, bare table mapping).
+// It also checks which field text the graph reads and the rules it shares
+// with the BigQuery graph.
 
 import {describe, expect, test} from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 
-import {SemanticModel} from '../../../src/libts/semantic/ir';
+import {generatePropertyGraph} from '../../../src/libts/semantic/bigquery';
+import {Entity, Field, SemanticModel, SqlDialect} from '../../../src/libts/semantic/ir';
+import {loadModels} from '../../../src/libts/semantic/loader';
 import {GenerateOptions, generateSpannerPropertyGraph} from '../../../src/libts/semantic/spanner';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
+
+// A model with no relationships or metrics unless `more` gives them.
+const modelOf = (name: string, entities: Entity[],
+                 more: Partial<SemanticModel> = {}): SemanticModel =>
+    ({name, entities, relationships: [], metrics: [], ...more});
+
+// An entity with one field per entry of `fields`. A string is the field's
+// expression.
+const entity = (name: string, dataSource: string, keys: string[],
+                fields: Record<string, string|Partial<Field>>,
+                more: Partial<Entity> = {}): Entity => ({
+  name, dataSource, keys, ...more,
+  fields: Object.entries(fields).map(([field, f]) =>
+      ({name: field, ...(typeof f === 'string' ? {expression: f} : f)})),
+});
+
+// A field's text in each dialect, stored as the loader stores it.
+const texts = (sql: Record<string, string>): Partial<Field> => {
+  const entries = Object.entries(sql) as [SqlDialect, string][];
+  const other = entries.find(([d]) => d !== 'BIGQUERY' && d !== 'ANSI_SQL');
+  return {
+    expression: sql.BIGQUERY ?? sql.ANSI_SQL,
+    dialects: entries.map(([dialect, expression]) => ({dialect, expression})),
+    ...other && {importedExpression: other[1], importedDialect: other[0]},
+  };
+};
 
 
 describe(
@@ -372,6 +402,214 @@ describe('reserved-word names in an M:N association edge are quoted', () => {
 });
 
 
+test('a field, key or join column reads its SPANNER text, else its ANSI_SQL text, without comments', () => {
+  // Spanner reads `#` as a comment, where PostgreSQL reads an operator. `share`
+  // is written only for Snowflake, and a transpile pass wrote BigQuery SQL into
+  // its `expression`.
+  const {ddl, warnings} = generateSpannerPropertyGraph(modelOf('shop', [
+    entity('orders', 'Orders', ['id'], {
+      id: 'orders.order_id -- the key',
+      cust: 'orders.cust_id /* the customer */',
+      order_day: texts({BIGQUERY: 'TIMESTAMP_TRUNC(order_ts, DAY)',
+                        SPANNER: "TIMESTAMP_TRUNC(order_ts, DAY, 'UTC')",
+                        ANSI_SQL: "DATE_TRUNC('day', order_ts)"}),
+      order_month: texts({BIGQUERY: 'TIMESTAMP_TRUNC(order_ts, MONTH)',
+                          ANSI_SQL: "DATE_TRUNC('month', order_ts)"}),
+      region: texts({BIGQUERY: 'region_code'}),
+      ratio: texts({SNOWFLAKE: 'DIV0(a, b)'}),
+      share: {...texts({SNOWFLAKE: 'DIV0(a, b)'}), expression: 'SAFE_DIVIDE(a, b)'},
+      flags: texts({POSTGRES: 'flags # 1'}),
+      net: texts({POSTGRES: 'net_amount # in cents',
+                  SPANNER: 'net_amount # in cents'}),
+      tax: texts({POSTGRES: 'tax_amount # 1', ANSI_SQL: 'tax_amount # 1'}),
+      fee: {importedExpression: 'fee_amount -- in cents',
+            importedDialect: 'SPANNER'},
+    }),
+    entity('customers', 'customers', ['cid'],
+           {cid: 'customers.customer_id # key'}),
+  ], {relationships: [{name: 'placed_by',
+                       source: {entity: 'orders', columns: ['cust']},
+                       destination: {entity: 'customers', columns: ['cid']}}]}));
+  for (const text of [
+         `TIMESTAMP_TRUNC(order_ts, DAY, 'UTC') AS order_day`,
+         `DATE_TRUNC('month', order_ts) AS order_month`, 'net_amount AS net',
+         'tax_amount AS tax', 'fee_amount AS fee', 'KEY(order_id)',
+         'KEY(customer_id)', 'SOURCE KEY(order_id) REFERENCES orders(order_id)',
+         'DESTINATION KEY(cust_id) REFERENCES customers(customer_id)']) {
+    expect(ddl).toContain(text);
+  }
+  for (const text of ['TIMESTAMP_TRUNC(order_ts, MONTH)', 'region', 'ratio',
+                      'share', 'DIV0', 'SAFE_DIVIDE', 'flags', '#', 'in cents',
+                      'the key', 'the customer']) {
+    expect(ddl).not.toContain(text);
+  }
+  expect(warnings).toEqual(['region', 'ratio', 'share', 'flags'].map(
+      f => `entity 'orders': field '${f}' has no 'SPANNER' or 'ANSI_SQL' ` +
+          `expression; omitted from the node table`));
+});
+
+
+describe('rules the Spanner graph shares with the BigQuery graph', () => {
+  // Each engine's name, generator, and quote around graph and table names.
+  const ENGINES = [
+    ['BigQuery', generatePropertyGraph, '`'],
+    ['Spanner', generateSpannerPropertyGraph, ''],
+  ] as const;
+
+  // Customer inherits `email` from the concrete parent Person and maps it to
+  // another column. Under the shared `Person` label the parent's column wins.
+  test('a subtype that remaps an inherited column gets its parent\'s', () => {
+    const model = modelOf('people', [
+      entity('Person', 'Person', ['id'], {id: 'id', email: 'email'}),
+      entity('Customer', 'Customer', ['id'], {id: 'id', email: 'contact_email'},
+             {extends: ['Person']}),
+    ]);
+    for (const [engine, generate, q] of ENGINES) {
+      const {ddl, warnings} = generate(model);
+      expect(ddl).toBe(`\
+CREATE OR REPLACE PROPERTY GRAPH ${q}people${q}
+NODE TABLES (
+  ${q}Person${q} AS Person
+    KEY(id)
+    DEFAULT LABEL
+    PROPERTIES(
+      id,
+      email
+    ),
+  ${q}Customer${q} AS Customer
+    KEY(id)
+    DEFAULT LABEL
+    PROPERTIES(
+      id,
+      email
+    )
+    LABEL Person
+    PROPERTIES(
+      id,
+      email
+    )
+);
+`);
+      expect(warnings).toEqual([
+        `entity 'Customer' remaps inherited property 'email' to a different ` +
+            `column/expression than its supertype; ${engine} allows only ` +
+            `one definition per property under a shared label, so the ` +
+            `supertype's is used and the subclass's remapping is dropped`,
+      ]);
+    }
+  });
+
+  // Spanner drops the metric with a warning, and BigQuery emits it. No entity
+  // in the lineitem fixture has a primary key, so the error comes before any
+  // metric is reached.
+  test('metric warnings come after the entity warnings, and the no-node-table error leaves them out', () => {
+    const noKey = (e: string) => `entity '${e}': empty KEY (no primary key); ` +
+        `node table skipped, as a graph node requires a KEY`;
+    const shop = modelOf('shop', [
+      entity('orders', 'Orders', ['id'], {id: 'id', amount: 'amount'}),
+      entity('drafts', 'Drafts', [], {id: 'id'}),
+      entity('party', '', [], {}, {abstract: true}),
+    ], {metrics: [{name: 'revenue', entity: 'orders',
+                   expression: 'SUM(orders.amount)'}]});
+    const [lineitem] = loadModels(
+        fs.readFileSync(path.join(FIXTURES, 'lineitem_databricks_ext.yaml'),
+                        'utf8'),
+        {allowLegacyBareSource: true}).models;
+    for (const [engine, generate] of ENGINES) {
+      expect(generate(shop).warnings, engine).toEqual([
+        noKey('drafts'),
+        `abstract entity 'party' is not a supertype of any concrete entity; ` +
+            `it has no table and no descendant to label, so it produces no ` +
+            `graph element`,
+        ...engine === 'Spanner' ?
+            [`metric 'revenue' is not emitted: Spanner Graph has no MEASURE, ` +
+             `so model-level metrics have no home in it`] :
+            [],
+      ]);
+      expect(() => generate(lineitem), engine).toThrow(new Error(
+          'cannot generate a property graph: every entity was skipped ' +
+          'because it has no primary key (a graph node requires a KEY); a ' +
+          `graph requires at least one NODE TABLE\n${noKey('lineitem')}\n` +
+          noKey('orders')));
+    }
+  });
+
+  // A field written only for the other engine is left out. A table, label or
+  // edge that this leaves with nothing to list gets NO PROPERTIES, since a
+  // missing clause would expose every column of its table.
+  test('NO PROPERTIES on an abstract label, a concrete parent\'s label, a table outside any hierarchy and an association edge', () => {
+    for (const [engine, generate, q] of ENGINES) {
+      const otherOnly = (column: string) =>
+          texts({[engine === 'Spanner' ? 'BIGQUERY' : 'SPANNER']: column});
+      expect(generate(modelOf('parties', [
+        entity('Party', '', [], {email: {}}, {abstract: true}),
+        entity('Customer', 'Customer', ['id'],
+               {id: 'id', email: otherOnly('c_email')}, {extends: ['Party']}),
+        entity('Supplier', 'Supplier', ['id'], {id: 'id', email: 's_email'},
+               {extends: ['Party']}),
+        entity('Person', 'Person', ['id'],
+               {id: otherOnly('person_id'), email: otherOnly('p_email')}),
+        entity('Employee', 'Employee', ['id'], {tier: 'tier'},
+               {extends: ['Person']}),
+        entity('Orders', 'Orders', ['id'],
+               {id: otherOnly('order_id'), status: otherOnly('order_status')}),
+      ], {relationships: [{
+        name: 'supplied_by',
+        source: {entity: 'Customer', columns: ['id']},
+        destination: {entity: 'Supplier', columns: ['id']},
+        association: {dataSource: 'CustomerSuppliers', keys: ['link_id'],
+                      sourceColumns: ['customer_id'],
+                      destinationColumns: ['supplier_id'],
+                      fields: [{name: 'grade', ...otherOnly('grade')}]},
+      }]})).ddl).toBe(`\
+CREATE OR REPLACE PROPERTY GRAPH ${q}parties${q}
+NODE TABLES (
+  ${q}Customer${q} AS Customer
+    KEY(id)
+    DEFAULT LABEL
+    PROPERTIES(
+      id
+    )
+    LABEL Party
+    NO PROPERTIES,
+  ${q}Supplier${q} AS Supplier
+    KEY(id)
+    DEFAULT LABEL
+    PROPERTIES(
+      id,
+      s_email AS email
+    )
+    LABEL Party
+    NO PROPERTIES,
+  ${q}Person${q} AS Person
+    KEY(person_id)
+    DEFAULT LABEL
+    NO PROPERTIES,
+  ${q}Employee${q} AS Employee
+    KEY(person_id)
+    DEFAULT LABEL
+    PROPERTIES(
+      tier
+    )
+    LABEL Person
+    NO PROPERTIES,
+  ${q}Orders${q} AS Orders
+    KEY(order_id)
+    NO PROPERTIES
+)
+EDGE TABLES (
+  ${q}CustomerSuppliers${q} AS supplied_by
+    KEY(link_id)
+    SOURCE KEY(customer_id) REFERENCES Customer(id)
+    DESTINATION KEY(supplier_id) REFERENCES Supplier(id)
+    NO PROPERTIES
+);
+`);
+    }
+  });
+});
+
+
 describe('a comment in a field expression', () => {
   // Left in, a line comment runs to the end of the line and swallows the
   // ` AS <name>` after the expression, and the comma after that.
@@ -402,38 +640,6 @@ describe('a comment in a field expression', () => {
     expect(ddl).not.toContain('the key');
     expect(ddl).not.toContain('free text');
     expect(warnings).toEqual([]);
-  });
-
-  test('is read in the dialect of imported vendor SQL', () => {
-    // PostgreSQL reads `--` as a comment and `#` as an operator, so only the
-    // comment comes out of imported vendor SQL. The graph's engine still reads
-    // `# 1` as a comment. Vendor SQL is wrong in a graph either way, and this
-    // keeps what the author wrote. A target text is read as the graph's engine
-    // reads it, even when a PostgreSQL entry holds the same text.
-    const vendor: SemanticModel = {
-      name: 'm',
-      relationships: [],
-      metrics: [],
-      entities: [{
-        name: 'orders',
-        dataSource: 'Orders',
-        keys: ['id'],
-        fields: [
-          {name: 'id', expression: 'id'},
-          {name: 'flags', dialects: [{dialect: 'POSTGRES', expression: 'flags # 1'}],
-           importedExpression: 'flags # 1', importedDialect: 'POSTGRES'},
-          {name: 'total', dialects: [{dialect: 'POSTGRES', expression: 'amount -- in cents'}],
-           importedExpression: 'amount -- in cents', importedDialect: 'POSTGRES'},
-          {name: 'net', expression: 'net_amount # in cents',
-           dialects: [{dialect: 'POSTGRES', expression: 'net_amount # in cents'},
-                      {dialect: 'SPANNER', expression: 'net_amount # in cents'}]},
-        ],
-      }],
-    };
-    const {ddl} = generateSpannerPropertyGraph(vendor);
-    expect(ddl).toContain('flags # 1 AS flags');
-    expect(ddl).toContain('amount AS total');
-    expect(ddl).toContain('net_amount AS net');
   });
 
   test('next to a dot leaves no space, so the qualifier still comes off', () => {
@@ -477,15 +683,16 @@ describe('a comment in a field expression', () => {
             {name: 'label', expression: text, importedExpression: text,
              importedDialect: 'POSTGRES',
              dialects: [{dialect: 'POSTGRES', expression: text},
-                        {dialect: 'BIGQUERY', expression: text}]},
+                        {dialect: 'SPANNER', expression: text}]},
           ],
         },
         {name: 'orders', dataSource: 'Orders', keys: ['id'], extends: ['base'],
          fields: []},
       ],
     };
-    const {ddl} = generateSpannerPropertyGraph(inherited);
+    const {ddl, warnings} = generateSpannerPropertyGraph(inherited);
     expect(ddl).not.toContain('base.second');
     expect(ddl.match(/first \|\| second \|\| ' ' AS label/g)).toHaveLength(3);
+    expect(warnings).toEqual([]);
   });
 });

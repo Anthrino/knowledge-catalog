@@ -17,8 +17,7 @@
 //   4. SQL text. Which SQL a field binds to: the engine's own dialect entry
 //      (`BIGQUERY` or `SPANNER`), falling back to the `ANSI_SQL` one.
 //
-// ./bigquery supplies the BigQuery engine; spanner.ts still writes its own
-// graph.
+// ./bigquery supplies the BigQuery engine, and ./spanner the Spanner engine.
 //
 
 import {AiContext, Association, Entity, Field, isFieldBound, Metric, Relationship, SemanticModel, SqlDialect,} from './ir';
@@ -224,7 +223,7 @@ export function generateGraphDdl(
   const leftOutUnder = new Map<string, Set<string>>();
   for (const e of validEntities) {
     for (const f of e.fields) {
-      if (!isFieldBound(f) || engine.fieldExpression(f) !== undefined) continue;
+      if (!hasOnlyOtherEnginesSql(f, engine)) continue;
       for (const a of e.extends ?? []) {
         leftOutUnder.set(a, (leftOutUnder.get(a) ?? new Set()).add(f.name));
       }
@@ -412,9 +411,8 @@ function renderNodeTable(
   const hasAncestors = !!(entity.extends && entity.extends.length);
   if (hasAncestors || isSupertype) lines.push(line(2, 'DEFAULT LABEL'));
   if (labelOpts) lines.push(line(2, labelOpts));
-  // Omit the PROPERTIES block when there is nothing to list, rather than emit
-  // an empty `PROPERTIES()` (a node table may declare just its KEY).
-  if (properties.length) lines.push(propertiesBlock(properties));
+  lines.push(...propertiesClause(
+      properties, entity.fields.some(f => hasOnlyOtherEnginesSql(f, engine))));
 
   // Inheritance: declare one LABEL per transitive ancestor (resolveInheritance
   // expanded `extends` to the full ancestor set), each re-listing that
@@ -443,6 +441,7 @@ function renderNodeTable(
     }
     lines.push(line(2, `LABEL ${quoteIfReserved(ancestorName)}`));
     let signature: string[];
+    let anyLeftOut = false;
     if (ancestor.abstract) {
       // Render each inherited field from THIS subtype's own binding, keyed by
       // the abstract ancestor's field names. Skip any the subtype leaves
@@ -450,10 +449,9 @@ function renderNodeTable(
       // fields); a profile that binds the subtype but not an inherited field
       // simply does not expose that property under the shared label.
       signature = [];
-      let leftOut = false;
       for (const af of ancestor.fields) {
         if (leftOutUnder.get(ancestorName)?.has(af.name)) {
-          leftOut = true;
+          anyLeftOut = true;
           continue;
         }
         const child = boundFields.find(cf => cf.name === af.name);
@@ -461,21 +459,30 @@ function renderNodeTable(
           signature.push(renderFieldProperty(child, entity.name, engine));
         }
       }
-      // A bare LABEL exposes every column of its table, so a label that a
-      // left-out field empties lists no properties instead.
-      if (!signature.length && leftOut) {
-        lines.push(line(2, 'NO PROPERTIES'));
-        continue;
-      }
     } else {
       // Only the fields the ancestor's own node table lists.
       signature =
           ancestor.fields.filter(f => engine.fieldExpression(f) !== undefined)
               .map(f => renderFieldProperty(f, ancestor.name, engine));
+      anyLeftOut =
+          ancestor.fields.some(f => hasOnlyOtherEnginesSql(f, engine));
     }
-    if (signature.length) lines.push(propertiesBlock(signature));
+    lines.push(...propertiesClause(signature, anyLeftOut));
   }
   return lines.join('\n');
+}
+
+// The properties clause of a table or label. When `anyLeftOut` is set, an
+// empty list gives NO PROPERTIES, since a missing clause exposes every column.
+function propertiesClause(
+    properties: string[], anyLeftOut: boolean): string[] {
+  if (properties.length) return [propertiesBlock(properties)];
+  return anyLeftOut ? [line(2, 'NO PROPERTIES')] : [];
+}
+
+// Whether a field has SQL, but none the engine reads.
+function hasOnlyOtherEnginesSql(field: Field, engine: GraphEngine): boolean {
+  return isFieldBound(field) && engine.fieldExpression(field) === undefined;
 }
 
 // Renders a field as a graph property: a bare column when the expression is
@@ -684,7 +691,9 @@ function renderAssociationEdge(
             return false;
           })
           .map(f => renderFieldProperty(f, rel.name, engine));
-  if (properties.length) lines.push(propertiesBlock(properties));
+  lines.push(...propertiesClause(
+      properties,
+      (assoc.fields ?? []).some(f => hasOnlyOtherEnginesSql(f, engine))));
 
   return lines.join('\n');
 }

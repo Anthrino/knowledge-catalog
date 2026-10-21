@@ -37,7 +37,7 @@
 
 import * as yaml from 'yaml';
 
-import {Action, Entity, expressionForDialect, Field, FIELD_BINDING_KEYS, fieldBinding, isFieldBound, Metric, ProfileEntityBinding, ProfileRelationshipBinding, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
+import {Action, Entity, expressionForDialect, Field, FIELD_BINDING_KEYS, isFieldBound, Metric, ProfileEntityBinding, ProfileRelationshipBinding, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
 import {databaseOf, DEFAULT_DIALECT, entityAndMetricWarnings, expressionDocOf, googleBlockProfiles, inferMetricEntities, inheritedNoSqlProblems, isAcceptedSource, joinLengthMessage, LoadOptions, loadSemanticModels, noSqlReason, parseExecutor, parseFieldBinding, parseFieldExpression, parseSource, readFieldExpression, SemanticModelError} from './loader';
 import {declaredConceptFields, InheritanceError, resolveInheritance} from './resolve_inheritance';
 import {columnReferences, coversKeyByColumns, entitiesReached, fieldsReadOn, isColumnName, keyColumn} from './sql_expr_utils';
@@ -645,11 +645,10 @@ export interface AvailabilityReport {
  * one of them, directly or through other fields; every excluded metric and
  * every metric that reads an unavailable field dropped; and every action with
  * no executor dropped. A field counts whether the entity declares or inherits
- * it. What a field or metric reads comes from the text `dialect` evaluates,
- * which defaults to the dialect the model's sources imply, and from the text
- * the Spanner graph generator emits (see prunedTexts). When the sources are in
- * systems of different dialects, or one names no system, there is no dialect
- * and every text counts.
+ * it. What a field or metric reads comes from the text `dialect` evaluates
+ * (see prunedTexts). `dialect` defaults to the dialect the model's sources
+ * imply. When the sources are in systems of different dialects, or one names
+ * no system, there is no dialect and every text counts.
  * The input is never mutated. The report names each dropped block
  * and the unbound field that stops it, so a caller can state the withheld
  * coverage. A model with nothing unbound resolves unchanged.
@@ -1332,8 +1331,7 @@ export function profileSourceMessage(entity: string): string {
 // entityAndMetricWarnings, which builds them with the helpers the load uses,
 // then the model file's other load warnings, about actions, which a profile
 // does not change. That is the order a load gives them. The applied model is
-// judged in the load's dialect, which picked the text each field holds and
-// the generators emit.
+// judged in the load's dialect, which picked the text each field holds.
 function warningsAfterProfile(
     model: SemanticModel, applied: SemanticModel,
     opts: Omit<ApplyProfileOptions, 'warnings'>): string[] {
@@ -1902,27 +1900,20 @@ function evaluatedTexts(
   }];
 }
 
-// The texts pruning reads: those a profile of `dialect` evaluates, and the text
-// the Spanner graph generator emits today, which is `fieldBinding` whatever the
-// engine. Reading both keeps a deployed graph from reading a field the profile
-// leaves unbound. The BigQuery generator already emits its own engine's text;
-// once Spanner does too, the emitted text adds nothing and this can read
-// `textsFor` alone.
+// The texts pruning reads: those a profile of `dialect` evaluates (see
+// textsFor). A BIGQUERY profile also reads `expression` for an item with no
+// BIGQUERY or ANSI_SQL text, since the BigQuery graph emits the SQL that push's
+// `--transpile` pass writes there.
 function prunedTexts(
     f: Pick<
         Field,
         'expression'|'dialects'|'importedExpression'|'importedDialect'>,
     dialect: string|undefined): Array<{text: string; dialect: string}> {
   const out = textsFor(f, dialect);
-  const emitted = fieldBinding(f);
-  if (emitted !== undefined && !out.some(t => t.text === emitted)) {
-    const written = dialectOf(f, emitted);
-    out.push({
-      text: emitted,
-      dialect: written === 'ANSI_SQL' && dialect ? dialect : written,
-    });
+  if (out.length || dialect !== 'BIGQUERY' || f.expression === undefined) {
+    return out;
   }
-  return out;
+  return [{text: f.expression, dialect}];
 }
 
 // The dialect a model's sources imply: that of the one database every concrete
@@ -2391,7 +2382,7 @@ export function validateProfileConsistency(
   if (inheritanceErrorOf(baseModel)) return errors;
   const byName = new Map(entities.map(e => [e.name, e]));
   // Each binding's fields, so a key or join column that names a field is read
-  // as that field's column, as the graph generators read it. A value the
+  // as that field's column, as the BigQuery graph reads it. A value the
   // loader's readers reject is left unapplied; the completeness check reports
   // it.
   const baseFields = fieldsByEntity(baseModel);
