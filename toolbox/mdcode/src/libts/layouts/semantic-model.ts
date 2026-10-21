@@ -19,11 +19,10 @@ import * as md from '../metadata';
 import {writeFileAtomic} from '../fsutil';
 import {kcV2Aspects} from '../semantic/kc_ids';
 import {modelDocumentVersion} from '../semantic/loader';
-import {saveModelEntries} from '../semantic/model_edits';
+import {deleteModelEntries, SaveOutcome, saveModelEntries} from '../semantic/model_edits';
 import {documentEntries, ModelFile, ModelScope, ViewEntry} from '../semantic/model_entries';
 import {nameProblem} from '../semantic/names';
 import {YAML_OPTIONS} from '../semantic/yaml_options';
-import {deleteEachEntry} from './batch';
 
 // The project and location of a semantic-model scope, which name the entries
 // of the entry view.
@@ -519,9 +518,11 @@ export class SemanticModelLayout implements CatalogLayout {
     if (!result.ok) throw new Error(result.error);
   }
 
-  async deleteEntry(_name: string): Promise<void> {
-    throw new Error(
-        'The SemanticModel layout does not support deleting per-entry files yet.');
+  // Deletes one entry as deleteEntries does, and throws its error when it
+  // fails.
+  async deleteEntry(name: string): Promise<void> {
+    const [result] = await this.deleteEntries([name]);
+    if (!result.ok) throw new Error(result.error);
   }
 
   // Saves each entry into the model file: a new element's entry is named by
@@ -532,7 +533,24 @@ export class SemanticModelLayout implements CatalogLayout {
   // fails the whole call.
   async saveEntries(entries: md.Entry[]): Promise<md.EntryResult[]> {
     const file = this._modelFile();
-    const outcome = saveModelEntries(file, entries, this._modelScope());
+    return this._write(
+        file, saveModelEntries(file, entries, this._modelScope()));
+  }
+
+  // Deletes each named entry's element from the model file, under the same
+  // checks: a delete that leaves the file not loading, or adds a push check
+  // error (an entity a relationship or metric still uses, say), fails. The
+  // model's anchor cannot be deleted.
+  async deleteEntries(names: string[]): Promise<md.EntryResult[]> {
+    const file = this._modelFile();
+    return this._write(
+        file, deleteModelEntries(file, names, this._modelScope()));
+  }
+
+  // Writes the model file a save or delete gives, once, in place and
+  // atomically, when it changed.
+  private async _write(file: ModelFile|undefined, outcome: SaveOutcome):
+      Promise<md.EntryResult[]> {
     if (outcome.text !== undefined) {
       const target = file ? this._index.get(file.name)! :
                             this.modelPath(outcome.model!);
@@ -541,10 +559,6 @@ export class SemanticModelLayout implements CatalogLayout {
       if (!file) this._index.set(path.basename(target, '.yaml'), target);
     }
     return outcome.results;
-  }
-
-  async deleteEntries(names: string[]): Promise<md.EntryResult[]> {
-    return deleteEachEntry(this, names);
   }
 }
 

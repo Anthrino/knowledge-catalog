@@ -29,7 +29,7 @@ export interface ModelAnchor {
 }
 
 // The lists of a model that hold its elements.
-type ElementList = 'entities'|'metrics'|'relationships';
+export type ElementList = 'entities'|'metrics'|'relationships';
 
 // The keys of a model that an anchor entry holds. `targets` is undefined when
 // the deployment targets do not change.
@@ -141,6 +141,23 @@ export class ModelDocument {
 
   addRelationship(rel: Relationship): void {
     this._append('relationships', relationshipDoc(rel, [], this._version));
+  }
+
+  // Removes an element. An empty entity list stays, as `entities: []`; an
+  // empty metric or relationship list is removed.
+  remove(list: ElementList, name: string): void {
+    const key = list === 'entities' ? this._entitiesKey() : list;
+    const model = this._modelNode();
+    const seq: unknown = model.get(key, true);
+    if (!yaml.isSeq(seq)) return;
+    seq.items = seq.items.filter(
+        item => !(yaml.isMap(item) && item.get('name') === name));
+    if (seq.items.length) return;
+    if (list === 'entities') {
+      seq.flow = true;
+    } else {
+      model.delete(key);
+    }
   }
 
   // Whether the entity declares `extends` or `abstract`.

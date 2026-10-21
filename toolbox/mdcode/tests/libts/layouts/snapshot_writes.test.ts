@@ -180,7 +180,8 @@ describe('the semantic-model layout', () => {
     const deleted = await snapshot.deleteEntries(['orders']);
 
     expect(saved[0].error).toContain("save the model's anchor entry");
-    expect(deleted[0].error).toContain('does not support deleting per-entry files yet');
+    expect(deleted[0].error).toBe(
+        "entry 'orders' does not exist in the semantic model");
   });
 });
 

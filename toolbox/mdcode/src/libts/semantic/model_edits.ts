@@ -1,8 +1,9 @@
-// Saves `kcmd entry save` items into a model file. Each item creates or
-// updates one element of the one model in the file. The edited file must load
-// and pass the local checks `kcmd push --no-profile` runs, and each element
-// must come back as its item sent it. An item that adds an error, or whose
-// element would come back changed, fails on its own and is not written.
+// Saves `kcmd entry save` items into a model file, and deletes `kcmd entry
+// delete` names from it. Each item creates, updates or deletes one element of
+// the one model in the file. The edited file must load and pass the local
+// checks `kcmd push --no-profile` runs, and each element must come back as its
+// item sent it, or be gone. An item that adds an error, or does not do what
+// it asks, fails on its own and is not written.
 //
 
 import * as dataplex from '../gcp/dataplex';
@@ -12,12 +13,12 @@ import {Entity, SemanticModel} from './ir';
 import {aspectDataOf, readAiContext, readDeploymentTargets, readEntity, readMetric} from './kc_converter';
 import {readRelationshipEntry, RELATIONSHIP_TYPE} from './kc_relationships';
 import {deploymentProfileError, LoadedModel} from './loader';
-import {ModelDocument} from './model_document';
+import {ElementList, ModelDocument} from './model_document';
 import {ElementKind, loadModelFile, ModelFile, modelEntries, ModelScope, ViewEntry} from './model_entries';
 import {NameKind, nameProblem} from './names';
 import {validatePushRequirements} from './validate';
 
-// What a save does to the model file.
+// What a save or delete does to the model file.
 export interface SaveOutcome {
   // One result per item, in the order given.
   results: md.EntryResult[];
@@ -44,16 +45,29 @@ const UPDATE_ASPECTS: Partial<Record<ElementKind, string[]>> = {
   relationship: [RELATIONSHIP_TYPE],
 };
 
+// The list of the model file that holds each kind of element a delete
+// removes.
+const LISTS: Record<'entity'|'metric'|'relationship', ElementList> = {
+  entity: 'entities',
+  metric: 'metrics',
+  relationship: 'relationships',
+};
+
 // One item that passed planning: the change it makes to the model file.
 interface Edit {
+  // The item's position in the call, and the name its result reports when
+  // it fails.
   index: number;
-  item: md.Entry;
-  kind: ElementKind;
-  element: string;
+  name: string;
   // Makes the change to `doc`, which it may modify, and returns the result.
   // Throws when the change cannot be made.
   apply(doc: ModelDocument|undefined): ModelDocument;
+  // The name the result reports when the edited model, shown as `view`,
+  // holds what the item asked for; otherwise why it does not.
+  outcome(view: ViewEntry[]): {name: string}|{error: string};
 }
+
+type Planned = Omit<Edit, 'index'>|string;
 
 // The model file before the save, as each step needs it.
 interface Base {
@@ -72,14 +86,37 @@ export function saveModelEntries(
     file: ModelFile|undefined, items: md.Entry[],
     scope: ModelScope): SaveOutcome {
   const base = readBase(file, scope);
-  const results: Array<md.EntryResult|undefined> =
-      new Array(items.length).fill(undefined);
   const planner = new Planner(base);
+  return applyEdits(
+      base, scope, items.map(item => ({name: item.name, planned: planner.plan(item)})));
+}
+
+
+// Deletes the named entries' elements from the model file `file`. Throws when
+// the file as it is does not load, which fails the whole call.
+export function deleteModelEntries(
+    file: ModelFile|undefined, names: string[],
+    scope: ModelScope): SaveOutcome {
+  const base = readBase(file, scope);
+  const planner = new Planner(base);
+  return applyEdits(
+      base, scope,
+      names.map(name => ({name, planned: planner.planDelete(name)})));
+}
+
+
+// Applies the planned edits, records one result per item, and gives the
+// file's new text.
+function applyEdits(
+    base: Base, scope: ModelScope,
+    plans: Array<{name: string; planned: Planned}>): SaveOutcome {
+  const file = base.file;
+  const results: Array<md.EntryResult|undefined> =
+      new Array(plans.length).fill(undefined);
   const edits: Edit[] = [];
-  items.forEach((item, index) => {
-    const planned = planner.plan(item);
+  plans.forEach(({name, planned}, index) => {
     if (typeof planned === 'string') {
-      results[index] = {name: item.name, ok: false, error: planned};
+      results[index] = {name, ok: false, error: planned};
     } else {
       edits.push({...planned, index});
     }
@@ -131,7 +168,7 @@ class Planner {
   }
 
   // The edit an item makes, or why it fails.
-  plan(item: md.Entry): Omit<Edit, 'index'>|string {
+  plan(item: md.Entry): Planned {
     const existing = this._byName.get(item.name);
     if (existing) return this._update(item, existing);
     if (/[./]/.test(item.name)) {
@@ -149,8 +186,35 @@ class Planner {
     return this._create(item, kind);
   }
 
-  private _create(item: md.Entry, kind: ElementKind): Omit<Edit, 'index'>|
-      string {
+  // The edit that deletes the named entry's element, or why it fails.
+  planDelete(name: string): Planned {
+    const existing = this._byName.get(name);
+    if (!existing) return `entry '${name}' does not exist in the semantic model`;
+    const {kind, element} = existing;
+    if (kind === 'model') {
+      return `deleting the model's anchor entry is not supported; delete the ` +
+          `model file to start over`;
+    }
+    if (kind === 'action' || kind === 'constraint') {
+      return `deleting semantic-${kind} entries is not supported yet`;
+    }
+    this._byName.delete(name);
+    this._namesOf(kind).delete(element);
+    return {
+      name,
+      apply: doc => {
+        if (!doc) throw new Error(`the model file has no ${kind} '${element}'`);
+        doc.remove(LISTS[kind], element);
+        return doc;
+      },
+      outcome: view =>
+          view.some(v => v.kind === kind && v.element === element) ?
+          {error: `the ${kind} '${element}' is still in the model`} :
+          {name},
+    };
+  }
+
+  private _create(item: md.Entry, kind: ElementKind): Planned {
     const name = item.name;
     const problem = nameProblem(kind as NameKind, name);
     if (problem) return problem;
@@ -178,7 +242,11 @@ class Planner {
         aiContext: readAiContext(entry),
         deployments: readDeploymentTargets(entry, name, [])?.deployments,
       };
-      return {item, kind, element: name, apply: () => ModelDocument.create(anchor)};
+      return {
+        name,
+        apply: () => ModelDocument.create(anchor),
+        outcome: view => savedOutcome(item, kind, name, view),
+      };
     }
 
     if (this._model === undefined) {
@@ -205,9 +273,7 @@ class Planner {
     }
     this._namesOf(kind).add(name);
     return {
-      item,
-      kind,
-      element: name,
+      name,
       apply: doc => {
         if (!doc) {
           throw new Error(
@@ -217,13 +283,13 @@ class Planner {
         add(doc);
         return doc;
       },
+      outcome: view => savedOutcome(item, kind, name, view),
     };
   }
 
   // Updates an existing element in place. The item holds the element as a
   // whole: a value it leaves out is removed, unless the view derives it.
-  private _update(item: md.Entry, existing: ViewEntry): Omit<Edit, 'index'>|
-      string {
+  private _update(item: md.Entry, existing: ViewEntry): Planned {
     const {kind, element} = existing;
     if (kind === 'action' || kind === 'constraint') {
       return `updating semantic-${kind} entries is not supported yet`;
@@ -277,14 +343,13 @@ class Planner {
       change = doc => doc.updateRelationship(rel);
     }
     return {
-      item,
-      kind,
-      element,
+      name: item.name,
       apply: doc => {
         if (!doc) throw new Error(`the model file has no ${kind} '${element}'`);
         change(doc);
         return doc;
       },
+      outcome: view => savedOutcome(item, kind, element, view),
     };
   }
 
@@ -310,8 +375,8 @@ class Checker {
   }
 
   // Applies every edit at once. Returns the edited document, after recording
-  // a result for each edit, when the edits add no error and each element
-  // comes back as sent; otherwise undefined, recording nothing.
+  // a result for each edit, when the edits add no error and each does what
+  // its item asks; otherwise undefined, recording nothing.
   applyAll(edits: Edit[], results: Array<md.EntryResult|undefined>):
       ModelDocument|undefined {
     if (!edits.length) return this._base.doc;
@@ -323,24 +388,28 @@ class Checker {
     }
     const checked = this._check(doc!, this._base.errors);
     if (checked.errors.length) return undefined;
-    const saved = edits.map(edit => this._saved(edit, checked.view!));
-    if (saved.some(s => s.error !== undefined)) return undefined;
+    const outcomes = edits.map(edit => edit.outcome(checked.view!));
+    const names: string[] = [];
+    for (const outcome of outcomes) {
+      if ('error' in outcome) return undefined;
+      names.push(outcome.name);
+    }
     edits.forEach((edit, k) => {
-      results[edit.index] = {name: saved[k].name!, ok: true};
+      results[edit.index] = {name: names[k], ok: true};
     });
     return doc;
   }
 
   // Applies the edits one at a time, each to the result of the edits before
   // it that succeeded, and records a result for each. An edit fails when it
-  // adds an error or its element does not come back as sent. Returns the
-  // last document that succeeded.
+  // adds an error or does not do what its item asks. Returns the last
+  // document that succeeded.
   applyEach(edits: Edit[], results: Array<md.EntryResult|undefined>):
       ModelDocument|undefined {
     let accepted = this._base.doc;
     let known = this._base.errors;
     for (const edit of edits) {
-      const name = edit.item.name;
+      const name = edit.name;
       let trial: ModelDocument;
       try {
         trial = edit.apply(accepted?.clone());
@@ -349,15 +418,16 @@ class Checker {
         continue;
       }
       const checked = this._check(trial, known);
-      const saved = checked.view ? this._saved(edit, checked.view) : undefined;
-      const error = checked.errors.length ? checked.errors.join('\n') : saved?.error;
-      if (error !== undefined) {
-        results[edit.index] = {name, ok: false, error};
+      const outcome = checked.errors.length ?
+          {error: checked.errors.join('\n')} :
+          edit.outcome(checked.view!);
+      if ('error' in outcome) {
+        results[edit.index] = {name, ok: false, error: outcome.error};
         continue;
       }
       accepted = trial;
       known = checked.all;
-      results[edit.index] = {name: saved!.name!, ok: true};
+      results[edit.index] = {name: outcome.name, ok: true};
     }
     return accepted;
   }
@@ -383,18 +453,22 @@ class Checker {
     };
   }
 
-  // The bare entry ID of the edit's element after the edit, or why the
-  // element does not come back as its item sent it.
-  private _saved(edit: Edit, view: ViewEntry[]): {name?: string; error?: string} {
-    const found = view.find(v => v.kind === edit.kind && v.element === edit.element);
-    if (!found) {
-      return {error: `the ${edit.kind} '${edit.element}' is not in the model after the save`};
-    }
-    const error = firstDifference(edit.item.type, found.entry.type, 'type') ??
-        firstDifference(edit.item.resource ?? {}, found.entry.resource, 'resource') ??
-        firstDifference(edit.item.aspects ?? {}, found.entry.aspects ?? {}, 'aspects');
-    return error ? {error} : {name: found.entry.name};
+}
+
+
+// The bare entry ID of a saved element, or why it does not come back as its
+// item sent it.
+function savedOutcome(
+    item: md.Entry, kind: ElementKind, element: string,
+    view: ViewEntry[]): {name: string}|{error: string} {
+  const found = view.find(v => v.kind === kind && v.element === element);
+  if (!found) {
+    return {error: `the ${kind} '${element}' is not in the model after the save`};
   }
+  const error = firstDifference(item.type, found.entry.type, 'type') ??
+      firstDifference(item.resource ?? {}, found.entry.resource, 'resource') ??
+      firstDifference(item.aspects ?? {}, found.entry.aspects ?? {}, 'aspects');
+  return error ? {error} : {name: found.entry.name};
 }
 
 

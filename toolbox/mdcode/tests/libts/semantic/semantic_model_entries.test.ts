@@ -781,3 +781,93 @@ describe('SemanticModelLayout saveEntries: updates in place', () => {
     expect(results[1].error).toContain('uses extends or abstract');
   });
 });
+
+describe('SemanticModelLayout deleteEntries', () => {
+  test('deletes elements nothing uses, removing only their lines', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    expect(await l.deleteEntries([
+      'commerce.relationships.orders_self',
+      'commerce.metrics.revenue',
+    ])).toEqual([
+      {name: 'commerce.relationships.orders_self', ok: true},
+      {name: 'commerce.metrics.revenue', ok: true},
+    ]);
+    const text = fs.readFileSync(p, 'utf8');
+    expect(diffLines(MODEL.split('\n'), text.split('\n'))
+               .every(h => h.lines.length === 0))
+        .toBe(true);
+    expect(text).not.toContain('orders_self');
+    expect(text).not.toContain('metrics:');
+    expect(l.listEntries()).not.toContain('commerce.metrics.revenue');
+  });
+
+  test('an entity a relationship uses is not deleted', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const [result] = await l.deleteEntries(['commerce.entities.customers']);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("'customers'");
+    expect(fs.readFileSync(p, 'utf8')).toBe(MODEL);
+  });
+
+  test('an entity a metric uses is not deleted; the rest of the call is',
+       async () => {
+         writeModel(MODEL);
+         const l = await layout();
+         const results = await l.deleteEntries([
+           'commerce.entities.orders',
+           'commerce.relationships.orders_to_customers',
+           'commerce.relationships.orders_to_customers_again',
+           'commerce.relationships.orders_self',
+         ]);
+         expect(results.map(r => r.ok)).toEqual([false, true, true, true]);
+         expect(results[0].error).toContain('orders');
+         expect(l.listEntries()).toEqual([
+           'commerce',
+           'commerce.entities.orders',
+           'commerce.entities.customers',
+           'commerce.metrics.revenue',
+         ]);
+       });
+
+  test('an entity goes with what uses it in one call, in any order', async () => {
+    writeModel(MODEL);
+    const l = await layout();
+    const results = await l.deleteEntries([
+      'commerce.entities.customers',
+      'commerce.relationships.orders_to_customers',
+      'commerce.relationships.orders_to_customers_again',
+    ]);
+    expect(results.every(r => r.ok)).toBe(true);
+    expect(l.entryExists('commerce.entities.customers')).toBe(false);
+  });
+
+  test('the anchor, an unknown entry and an element name are not deleted',
+       async () => {
+         writeModel(MODEL);
+         const l = await layout();
+         const [anchor, unknown, bare] = await l.deleteEntries(
+             ['commerce', 'commerce.entities.suppliers', 'orders']);
+         expect(anchor.error).toContain('anchor entry is not supported');
+         expect(unknown.error).toContain('does not exist');
+         expect(bare.error).toContain('does not exist');
+       });
+
+  test('deleting the last entity leaves an anchor-only model', async () => {
+    const p = writeModel(ANCHOR_ONLY.replace(
+        '    entities: []\n',
+        '    entities:\n' +
+            '      - name: orders\n' +
+            `        source: ${ORDERS_TABLE}\n` +
+            '        primary_key: [order_id]\n' +
+            '        fields:\n' +
+            '          - name: order_id\n' +
+            '            expression: order_id\n'));
+    const l = await layout();
+    expect(await l.deleteEntries(['commerce.entities.orders'])).toEqual(
+        [{name: 'commerce.entities.orders', ok: true}]);
+    expect(l.listEntries()).toEqual(['commerce']);
+    expect(fs.readFileSync(p, 'utf8')).toContain('    entities: []\n');
+  });
+});
