@@ -35,6 +35,15 @@ const CREATABLE: Record<string, ElementKind> = {
   [RELATIONSHIP_TYPE]: 'relationship',
 };
 
+// The aspects the view always gives an element, which an update must hold:
+// leaving one out would remove all it holds, such as every field.
+const UPDATE_ASPECTS: Partial<Record<ElementKind, string[]>> = {
+  model: ['semantic-model'],
+  entity: ['semantic-entity', 'schema'],
+  metric: ['semantic-metric'],
+  relationship: [RELATIONSHIP_TYPE],
+};
+
 // One item that passed planning: the change it makes to the model file.
 interface Edit {
   index: number;
@@ -109,19 +118,22 @@ class Planner {
   private _model?: string;
   // The elements the model has, or that earlier items create, by kind.
   private readonly _names = new Map<ElementKind, Set<string>>();
+  // The entities that use inheritance, which an update does not edit.
+  private readonly _inheriting: Set<string>;
 
   constructor(base: Base) {
     this._byName = new Map(base.view.map(v => [v.entry.name, v]));
     this._model = base.model?.name;
     for (const v of base.view) this._namesOf(v.kind).add(v.element);
+    this._inheriting = new Set((base.model?.entities ?? [])
+                                   .filter(e => e.extends?.length || e.abstract)
+                                   .map(e => e.name));
   }
 
   // The edit an item makes, or why it fails.
   plan(item: md.Entry): Omit<Edit, 'index'>|string {
     const existing = this._byName.get(item.name);
-    if (existing) {
-      return `updating an existing ${existing.kind} is not supported yet`;
-    }
+    if (existing) return this._update(item, existing);
     if (/[./]/.test(item.name)) {
       return `'${item.name}' is not an entry of the model; to create an ` +
           `element, name its entry by the element's own name, such as ` +
@@ -203,6 +215,74 @@ class Planner {
               `cannot be either`);
         }
         add(doc);
+        return doc;
+      },
+    };
+  }
+
+  // Updates an existing element in place. The item holds the element as a
+  // whole: a value it leaves out is removed, unless the view derives it.
+  private _update(item: md.Entry, existing: ViewEntry): Omit<Edit, 'index'>|
+      string {
+    const {kind, element} = existing;
+    if (kind === 'action' || kind === 'constraint') {
+      return `updating semantic-${kind} entries is not supported yet`;
+    }
+    const displayName = item.resource?.displayName;
+    if (displayName !== undefined && displayName !== element) {
+      return `resource.displayName '${displayName}' must equal the ${kind}'s ` +
+          `name '${element}'; renaming is not supported`;
+    }
+    const keys = Object.keys(item.aspects ?? {});
+    const missing = (UPDATE_ASPECTS[kind] ?? [])
+                        .filter(type => !keys.some(k => k.endsWith(`.${type}`)));
+    if (missing.length) {
+      return `an update holds the whole ${kind}, as kcmd entry get prints ` +
+          `it; the ${missing.join(' and ')} aspect is missing`;
+    }
+    let entry: Entry;
+    try {
+      entry = toServiceEntry(item, element);
+    } catch (err: any) {
+      return err?.message ?? String(err);
+    }
+    const warnings: string[] = [];
+    let change: (doc: ModelDocument) => void;
+    if (kind === 'model') {
+      const targets = readDeploymentTargets(entry, element, [])
+                          ?.deployments.map(d => d.target) ?? [];
+      const update = {
+        description: entry.entrySource?.description,
+        instructions: readAiContext(entry)?.instructions,
+        targets: sameSet(targets, deploymentTargetsOf(existing.entry)) ?
+            undefined :
+            targets,
+      };
+      change = doc => doc.updateModel(update);
+    } else if (kind === 'entity') {
+      if (this._inheriting.has(element)) {
+        return `entity '${element}' uses extends or abstract; updating it ` +
+            `is not supported yet`;
+      }
+      const entity = readEntity(entry, warnings);
+      readStringFields(entity, entry);
+      change = doc => doc.updateEntity(entity);
+    } else if (kind === 'metric') {
+      const metric = readMetric(entry, [...this._namesOf('entity')], warnings);
+      change = doc => doc.updateMetric(metric);
+    } else {
+      const problems: string[] = [];
+      const rel = readRelationshipEntry(entry, problems);
+      if (!rel || problems.length) return problems.join('; ');
+      change = doc => doc.updateRelationship(rel);
+    }
+    return {
+      item,
+      kind,
+      element,
+      apply: doc => {
+        if (!doc) throw new Error(`the model file has no ${kind} '${element}'`);
+        change(doc);
         return doc;
       },
     };
@@ -350,6 +430,23 @@ function readStringFields(entity: Entity, entry: Entry): void {
 }
 
 
+// The deployment targets an anchor entry of the view holds.
+function deploymentTargetsOf(anchor: md.Entry): string[] {
+  const key = Object.keys(anchor.aspects ?? {})
+                  .find(k => k.endsWith('.semantic-model'));
+  const targets = key ? anchor.aspects![key].deploymentTargets : undefined;
+  return Array.isArray(targets) ? targets.filter(t => typeof t === 'string') :
+                                  [];
+}
+
+
+function sameSet(a: string[], b: string[]): boolean {
+  const left = new Set(a);
+  const right = new Set(b);
+  return left.size === right.size && [...left].every(x => right.has(x));
+}
+
+
 // An item as the Dataplex entry the converters read: each aspect keyed and
 // typed by its type reference, `resource` as the entry source.
 function toServiceEntry(item: md.Entry, name: string): Entry {
@@ -381,14 +478,18 @@ function toServiceEntry(item: md.Entry, name: string): Entry {
 
 // Where `saved` does not hold what `sent` holds, as a message naming the
 // path, or undefined when it does. A value `sent` leaves out is not compared,
-// so a value the view derives may be left out.
+// so a value the view derives may be left out. A list of named records, such
+// as a schema's fields, is compared by name: the model file keeps its own
+// order.
 function firstDifference(sent: unknown, saved: unknown, at: string): string|
     undefined {
   if (sent === undefined) return undefined;
   if (Array.isArray(sent)) {
-    if (!Array.isArray(saved) || saved.length !== sent.length) {
-      return differs(at, sent, saved);
+    if (!Array.isArray(saved)) return differs(at, sent, saved);
+    if (namedRecords(sent) && namedRecords(saved)) {
+      return namedDifference(sent, saved, at);
     }
+    if (saved.length !== sent.length) return differs(at, sent, saved);
     for (let i = 0; i < sent.length; i++) {
       const d = firstDifference(sent[i], saved[i], `${at}[${i}]`);
       if (d) return d;
@@ -410,7 +511,40 @@ function firstDifference(sent: unknown, saved: unknown, at: string): string|
 }
 
 
+// Whether every item is a record with a string `name`.
+function namedRecords(list: any[]): boolean {
+  return list.length > 0 && list.every(r => typeof r?.name === 'string');
+}
+
+
+// firstDifference for two lists of named records, matched by name.
+function namedDifference(sent: any[], saved: any[], at: string): string|
+    undefined {
+  const seen = new Set<string>();
+  for (const record of sent) {
+    if (seen.has(record.name)) return `${at}: '${record.name}' appears twice`;
+    seen.add(record.name);
+  }
+  const byName = new Map(saved.map(r => [r.name, r]));
+  for (const [i, record] of sent.entries()) {
+    const d = firstDifference(record, byName.get(record.name), `${at}[${i}]`);
+    if (d) return d;
+  }
+  const extra = saved.map(r => r.name).filter(n => !seen.has(n));
+  return extra.length ?
+      `${at}: ${extra.map(n => `'${n}'`).join(', ')} would be saved too` :
+      undefined;
+}
+
+
 function differs(at: string, sent: unknown, saved: unknown): string {
-  return `${at}: ${JSON.stringify(sent)} would be saved as ${
-      saved === undefined ? 'nothing' : JSON.stringify(saved)}`;
+  return `${at}: ${shown(sent)} would be saved as ${
+      saved === undefined ? 'nothing' : shown(saved)}`;
+}
+
+
+// A value as JSON, cut short when long.
+function shown(value: unknown): string {
+  const json = JSON.stringify(value);
+  return json.length > 120 ? `${json.slice(0, 117)}...` : json;
 }
