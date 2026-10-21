@@ -213,6 +213,15 @@ describe('kcmd entry on a semantic-model workspace', () => {
     expect(err).toEqual(['Error: the SQL parser could not be loaded: simulated']);
   });
 
+  test('delete removes an element from the model file', async () => {
+    writeSemanticWorkspace();
+    expect(await entry('delete', ['commerce.entities.Customer'])).toBe(0);
+    expect(printed()).toEqual([{name: 'commerce.entities.Customer', ok: true}]);
+    const model = fs.readFileSync(
+        path.join('catalog', 'EntryGroups', 'commerce_eg', 'commerce.yaml'), 'utf8');
+    expect(model).not.toContain('Customer');
+  });
+
   test('get of an element name, not an entry name, fails', async () => {
     writeSemanticWorkspace();
     expect(await entry('get', ['Customer'])).toBe(1);
