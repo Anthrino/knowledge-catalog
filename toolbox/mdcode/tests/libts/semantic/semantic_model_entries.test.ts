@@ -547,17 +547,15 @@ describe('SemanticModelLayout saveEntries: new elements', () => {
          expect(orphan.error).toContain("save the model's anchor entry");
        });
 
-  test('a renaming display name, an action and an update fail', async () => {
+  test('a renaming display name and an action fail', async () => {
     writeModel(MODEL);
     const l = await layout();
     const results = await l.saveEntries([
       {...PRODUCTS, resource: {displayName: 'items'}},
       {name: 'refund', type: 'test-project.global.semantic-action', resource: {}},
-      await l.loadEntry('commerce.entities.orders'),
     ]);
     expect(results[0].error).toContain('renaming is not supported');
     expect(results[1].error).toContain('semantic-action entries is not supported');
-    expect(results[2].error).toContain('not supported yet');
   });
 
   test('names created entries with the second-generation layout', async () => {
@@ -589,5 +587,197 @@ semantic_model:
     const text = fs.readFileSync(p, 'utf8');
     expect(text).not.toContain('entities:');
     expect(text).toContain('      - name: products');
+  });
+});
+
+describe('SemanticModelLayout saveEntries: updates in place', () => {
+  async function entriesOf(l: SemanticModelLayout) {
+    const out = [];
+    for (const name of l.listEntries()) out.push(await l.loadEntry(name));
+    return out;
+  }
+
+  for (const v2 of [false, true]) {
+    test(`saving every entry as get gives it writes nothing${v2 ? ' (V2)' : ''}`,
+         async () => {
+           if (v2) process.env.KC_V2_ASPECTS = '1';
+           const p = writeModel(MODEL);
+           const mtime = fs.statSync(p).mtimeMs;
+           const l = await layout();
+           const entries = await entriesOf(l);
+           const results = await l.saveEntries(entries);
+           expect(results).toEqual(entries.map(e => ({name: e.name, ok: true})));
+           expect(fs.readFileSync(p, 'utf8')).toBe(MODEL);
+           expect(fs.statSync(p).mtimeMs).toBe(mtime);
+         });
+  }
+
+  test('changes only the lines of the values that change', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const orders = await l.loadEntry('commerce.entities.orders');
+    orders.resource.description = 'One row per placed order.';
+    orders.aspects![`${SYS}.schema`].fields.push({
+      name: 'status',
+      dataType: 'STRING',
+      metadataType: 'STRING',
+      semantics: {expression: 'status'},
+    });
+    expect(await l.saveEntries([orders])).toEqual(
+        [{name: 'commerce.entities.orders', ok: true}]);
+    const text = fs.readFileSync(p, 'utf8');
+    const hunks = diffLines(MODEL.split('\n'), text.split('\n'));
+    expect(hunks.map(h => [MODEL.split('\n').slice(h.start, h.end), h.lines]))
+        .toEqual([
+          [['        description: One row per order.'],
+           ['        description: One row per placed order.']],
+          [[], [
+            '          - name: status',
+            '            expression: status',
+            '            datatype: String',
+          ]],
+        ]);
+  });
+
+  test('a field a metric reads cannot be removed; another can', async () => {
+    writeModel(MODEL);
+    const l = await layout();
+    const orders = await l.loadEntry('commerce.entities.orders');
+    const schema = orders.aspects![`${SYS}.schema`];
+    const withoutAmount = structuredClone(orders);
+    withoutAmount.aspects![`${SYS}.schema`].fields =
+        schema.fields.filter((f: any) => f.name !== 'amount');
+    const [refused] = await l.saveEntries([withoutAmount]);
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('amount');
+
+    schema.fields = schema.fields.filter((f: any) => f.name !== 'order_date');
+    expect(await l.saveEntries([orders])).toEqual(
+        [{name: 'commerce.entities.orders', ok: true}]);
+    expect(l.listEntries()).toContain('commerce.entities.orders');
+    expect((await l.loadEntry('commerce.entities.orders'))
+               .aspects![`${SYS}.schema`].fields.map((f: any) => f.name))
+        .toEqual(['order_id', 'customer_id', 'amount']);
+  });
+
+  test('a new expression replaces the BIGQUERY entry and keeps the others',
+       async () => {
+         const p = writeModel(MODEL.replace(
+             '          - name: amount\n            expression: amount\n',
+             '          - name: amount\n            expression:\n' +
+                 '              dialects:\n' +
+                 '                - dialect: SNOWFLAKE\n' +
+                 '                  expression: AMOUNT\n' +
+                 '                - dialect: BIGQUERY\n' +
+                 '                  expression: amount\n'));
+         const l = await layout();
+         const orders = await l.loadEntry('commerce.entities.orders');
+         const amount = orders.aspects![`${SYS}.schema`].fields.find(
+             (f: any) => f.name === 'amount');
+         amount.semantics.expression = 'amount / 100';
+         expect((await l.saveEntries([orders]))[0].ok).toBe(true);
+         const text = fs.readFileSync(p, 'utf8');
+         expect(text).toContain(
+             '                - dialect: SNOWFLAKE\n' +
+             '                  expression: AMOUNT\n' +
+             '                - dialect: BIGQUERY\n' +
+             '                  expression: amount / 100\n');
+       });
+
+  test('a dimension keeps is_time, and the DEFAULT role removes it', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const fieldOf = (e: any) => e.aspects[`${SYS}.schema`].fields.find(
+        (f: any) => f.name === 'order_date');
+    const orders = await l.loadEntry('commerce.entities.orders');
+    fieldOf(orders).description = 'The day the order was placed.';
+    expect((await l.saveEntries([orders]))[0].ok).toBe(true);
+    expect(fs.readFileSync(p, 'utf8')).toContain('            dimension:\n              is_time: true\n');
+
+    const again = await l.loadEntry('commerce.entities.orders');
+    fieldOf(again).semantics.role = 'DEFAULT';
+    expect((await l.saveEntries([again]))[0].ok).toBe(true);
+    expect(fs.readFileSync(p, 'utf8')).not.toContain('dimension:');
+  });
+
+  test('updates a metric; an entity its expression contradicts fails', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const revenue = await l.loadEntry('commerce.metrics.revenue');
+    const aspect = revenue.aspects![`${SYS}.semantic-metric`];
+    aspect.expression = 'SUM(orders.amount) * 2';
+    expect((await l.saveEntries([revenue]))[0].ok).toBe(true);
+    expect(fs.readFileSync(p, 'utf8')).toContain('expression: SUM(orders.amount) * 2');
+
+    aspect.entity = 'customers';
+    const [result] = await l.saveEntries([revenue]);
+    expect(result.error).toBe(
+        `aspects.${SYS}.semantic-metric.entity: "customers" would be saved as "orders"`);
+  });
+
+  test('updates a relationship\'s columns, description and synonyms', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const join = await l.loadEntry('commerce.relationships.orders_self');
+    join.resource.description = 'An order and itself.';
+    const aspect = join.aspects![`${SYS}.semantic-relationship`];
+    aspect.source.fields = ['order_id'];
+    aspect.target.fields = ['order_id'];
+    aspect.synonyms = ['same order'];
+    expect((await l.saveEntries([join]))[0].ok).toBe(true);
+    expect(fs.readFileSync(p, 'utf8')).toContain(
+        '      - name: orders_self\n' +
+        '        from: orders\n' +
+        '        to: orders\n' +
+        '        from_columns: [order_id]\n' +
+        '        to_columns: [order_id]\n' +
+        '        description: An order and itself.\n' +
+        '        ai_context:\n' +
+        '          synonyms: [same order]\n');
+  });
+
+  test('updates the anchor; a deployment whose target stays keeps its name',
+       async () => {
+         const p = writeModel(MODEL);
+         const l = await layout();
+         const anchor = await l.loadEntry('commerce');
+         anchor.resource.description = 'Orders, customers and revenue.';
+         expect((await l.saveEntries([anchor]))[0].ok).toBe(true);
+         let text = fs.readFileSync(p, 'utf8');
+         expect(text).toContain('    description: Orders, customers and revenue.\n');
+         expect(text).toContain(`      - name: graph\n        target: ${GRAPH}\n`);
+
+         const other = GRAPH.replace('/commerce', '/commerce_v2');
+         anchor.aspects![`${SYS}.semantic-model`].deploymentTargets = [other];
+         expect((await l.saveEntries([anchor]))[0].ok).toBe(true);
+         text = fs.readFileSync(p, 'utf8');
+         expect(text).toContain(`      - name: default\n        target: ${other}\n`);
+         expect(text).not.toContain('name: graph');
+       });
+
+  test('an update that leaves out an aspect the view gives fails', async () => {
+    const p = writeModel(MODEL);
+    const l = await layout();
+    const orders = await l.loadEntry('commerce.entities.orders');
+    delete orders.aspects![`${SYS}.schema`];
+    const [result] = await l.saveEntries([orders]);
+    expect(result.error).toContain('the schema aspect is missing');
+    expect(fs.readFileSync(p, 'utf8')).toBe(MODEL);
+  });
+
+  test('a rename and an entity that uses extends fail', async () => {
+    writeModel(MODEL.replace(
+        '    relationships:\n',
+        '      - name: vip_customers\n' +
+            '        extends: [customers]\n' +
+            `        source: ${CUSTOMERS_TABLE.replace('customers', 'vips')}\n` +
+            '    relationships:\n'));
+    const l = await layout();
+    const orders = await l.loadEntry('commerce.entities.orders');
+    orders.resource.displayName = 'purchases';
+    const vip = await l.loadEntry('commerce.entities.vip_customers');
+    const results = await l.saveEntries([orders, vip]);
+    expect(results[0].error).toContain('renaming is not supported');
+    expect(results[1].error).toContain('uses extends or abstract');
   });
 });
