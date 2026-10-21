@@ -40,7 +40,7 @@ import * as yaml from 'yaml';
 import {Action, Entity, expressionForDialect, Field, FIELD_BINDING_KEYS, fieldBinding, isFieldBound, Metric, ProfileEntityBinding, ProfileRelationshipBinding, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
 import {databaseOf, DEFAULT_DIALECT, entityAndMetricWarnings, expressionDocOf, googleBlockProfiles, inferMetricEntities, inheritedNoSqlProblems, isAcceptedSource, joinLengthMessage, LoadOptions, loadSemanticModels, noSqlReason, parseExecutor, parseFieldBinding, parseFieldExpression, parseSource, readFieldExpression, SemanticModelError} from './loader';
 import {declaredConceptFields, InheritanceError, resolveInheritance} from './resolve_inheritance';
-import {columnReferences, entitiesReached, fieldsReadOn, isColumnName, keysCoveredByColumns} from './sql_expr_utils';
+import {columnReferences, coversKeyByColumns, entitiesReached, fieldsReadOn, isColumnName, keyColumn} from './sql_expr_utils';
 import {SqlColumn} from './sql_parser';
 import {transpilesFrom} from './transpile';
 import {YAML_OPTIONS} from './yaml_options';
@@ -2345,29 +2345,33 @@ export function validateProfileCompleteness(
 }
 
 /**
- * Returns one message per way `profiles` disagree with each other about the
- * model, or an empty list:
+ * Returns one message for each entity and each binding that breaks a rule
+ * below, or an empty list:
  *   - where the model file states no key for an entity, either every profile
  *     states keys of one shape, or none does;
  *   - in every binding that states a relationship's join columns, the model
  *     file's included, its `to_columns` cover a primary or unique key of the
- *     target, and the same keys in every binding, because cardinality is a
- *     property of the model. A superset of a key
- *     covers it (see keysCoveredBy).
+ *     target. A superset of a key covers it (see coversKey).
+ * Relationships are checked only after the hierarchy resolves. A binding
+ * whose key or join columns do not all read as bare or backtick-quoted columns
+ * is left out. `applied` names the profile the push applies. The "covers no
+ * key" check then leaves out that profile's join, or the model file's when the
+ * profile states none.
  */
 export function validateProfileConsistency(
-    baseModel: SemanticModel, profiles: ProfileSpec[]): string[] {
+    baseModel: SemanticModel, profiles: ProfileSpec[],
+    applied?: string): string[] {
   const errors: string[] = [];
   const entities = baseModel.entities ?? [];
   const bindingIn = (p: ProfileSpec, entity: string) =>
       p.entities.find(e => e.name === entity);
 
   for (const e of entities) {
-    if (e.abstract || e.keys.length || e.uniqueKeys?.length) continue;
+    if (e.abstract || statesKey(e.keys, e.uniqueKeys)) continue;
     const shapes = new Map<string, string[]>();
     for (const p of profiles) {
       const pe = bindingIn(p, e.name);
-      const shape = pe && (pe.primaryKey?.length || pe.uniqueKeys?.length) ?
+      const shape = pe && statesKey(pe.primaryKey, pe.uniqueKeys) ?
           `primary key of ${pe.primaryKey?.length ?? 0}, unique keys ${
               shapeOf(pe.uniqueKeys ?? [])}` :
           'no keys';
@@ -2383,6 +2387,8 @@ export function validateProfileConsistency(
     }
   }
 
+  // What an entity inherits is not known until the hierarchy resolves.
+  if (inheritanceErrorOf(baseModel)) return errors;
   const byName = new Map(entities.map(e => [e.name, e]));
   // Each binding's fields, so a key or join column that names a field is read
   // as that field's column, as the graph generators read it. A value the
@@ -2395,35 +2401,38 @@ export function validateProfileConsistency(
     if (r.association) continue;
     const target = byName.get(r.destination.entity);
     if (!target || target.abstract) continue;
-    // Every binding that binds the relationship, by stating its join columns,
-    // covers a key of the target, and the same keys as every other binding,
-    // because cardinality is a property of the model. A binding's keys are its
-    // own where it states them and the model file's otherwise. A join that
-    // covers no key is neither many-to-one nor one-to-one, so it is rejected. A binding
-    // that states no join columns does not bind the relationship and is left
-    // out; for a named profile, completeness reports that.
-    const answers = new Map<string, string[]>();
+    const appliedJoin = profiles.find(p => p.name === applied)
+                            ?.relationships.find(x => x.name === r.name);
+    // Push's own key check reports this binding's join, so it is left out here.
+    const checkedByPush = applied === undefined ? undefined :
+        appliedJoin?.toColumns.length ? `profile '${applied}'` :
+                                        'the model file';
+    // A binding's keys are its own where it states them and the model file's
+    // otherwise. A binding with no join columns is left out; completeness
+    // reports it for a named profile.
     const record =
         (who: string, fields: Map<string, Map<string, Field>>, to: string[],
          pk: string[], uks: string[][]) => {
-          if (!to.length) return;
           const entity = {
             name: target.name,
             fields: [...(fields.get(target.name)?.values() ?? [])],
           };
-          const covered = keysCoveredByColumns(entity, to, pk, uks);
+          // The column name checks report a value that is not a column name.
+          // Push's key check may misread a field bound to anything but a bare
+          // or backtick-quoted column, such as PostgreSQL's "c_id".
+          if (!to.length || ![...to, ...pk, ...uks.flat()].every(
+                  c => /^(\w+|`[^`]+`)$/.test(keyColumn(entity, c) ?? c))) {
+            return;
+          }
+          const covered = coversKeyByColumns(entity, to, pk, uks);
           // A key that names a field with no column in this binding cannot be
           // judged here.
-          if (!covered) return;
-          if (!covered.length) {
+          if (covered === false && who !== checkedByPush) {
             errors.push(
                 `relationship '${r.name}': ${who} joins on to_columns ${
                     JSON.stringify(to)}, which cover no primary or unique key ` +
                 `of '${target.name}'`);
-            return;
           }
-          const a = covered.join(' and ');
-          answers.set(a, [...(answers.get(a) ?? []), who]);
         };
     record(
         'the model file', baseFields, r.destination.columns, target.keys,
@@ -2436,14 +2445,6 @@ export function validateProfileConsistency(
           pr?.toColumns ?? [],
           pe?.primaryKey ?? target.keys,
           pe?.uniqueKeys ?? target.uniqueKeys ?? []);
-    }
-    if (answers.size > 1) {
-      const detail =
-          [...answers].map(([a, who]) => `${who.join(', ')}: ${a}`).join('; ');
-      errors.push(
-          `relationship '${r.name}' covers different keys under different ` +
-          `bindings (${detail}); its 'to_columns' must cover the same keys in ` +
-          `every binding`);
     }
   }
   return errors;
@@ -2583,9 +2584,10 @@ function nonEmptyKeys(keys: string[][]|undefined): string[][] {
   return (keys ?? []).filter(k => k.length > 0);
 }
 
-// "[2, 1]": how many unique keys, and how wide each is. An empty unique key
+// "[1, 2]": how wide each unique key is, narrowest first. An empty unique key
 // counts as none.
 function shapeOf(keys: string[][]): string {
-  return `[${nonEmptyKeys(keys).map(k => k.length).join(', ')}]`;
+  const widths = nonEmptyKeys(keys).map(k => k.length).sort((a, b) => a - b);
+  return `[${widths.join(', ')}]`;
 }
 

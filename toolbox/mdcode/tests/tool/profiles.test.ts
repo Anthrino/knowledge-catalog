@@ -714,6 +714,23 @@ ${joined ? '        from_columns: [p_customer]\n        to_columns: [c_id]\n' : 
   const customerUnbound = (model: string) =>
       model.replace(`        source: ${BQ('dev', 'customer')}\n`, '');
 
+  // `text` with the join on c_email in place of c_id.
+  const joinOnEmail = (text: string) =>
+      text.replace('to_columns: [c_id]', 'to_columns: [c_email]');
+
+  // The profile comparison's error for a join of `who` on `to` that covers no
+  // key of customer.
+  const compared = (who: string, to: string) =>
+      `[commerce] relationship 'placed_by': ${who} joins on to_columns ` +
+      `["${to}"], which cover no primary or unique key of 'customer'`;
+
+  // Push's own error for a join on `to` in `binding` that covers no key.
+  const own = (binding: string, to: string) =>
+      `relationship 'placed_by' in model 'commerce' (${binding}): its ` +
+      `to_columns ["${to}"] cover no primary or unique key of 'customer'; ` +
+      "join on every column of one of its keys, and declare that key if " +
+      "'customer' has none.";
+
   // A profile file that binds both entities to the prod tables, customer with
   // key `key`, and the join between them.
   function profileFile(name: string, key = 'c_id'): string {
@@ -811,6 +828,24 @@ ${target ? `    deployment_target: ${GRAPH}\n` : ''}\
     }
     expect(errs).toContain(lines[at]);
     return out;
+  }
+
+  // Each push in `pushes` fails with exactly its errors, or passes with none,
+  // and `kcmd profiles` shows them under that binding. A key names the profile
+  // the push applies, or 'default' for none.
+  async function expectPushes(pushes: Record<string, string[]>, label = '') {
+    for (const [profile, errors] of Object.entries(pushes)) {
+      expect({label, profile, ...await pushResult(profile)})
+          .toEqual({label, profile, code: errors.length ? 1 : 0, errors});
+    }
+    expect(await profiles()).toBe(1);
+    const inline = logs.includes(INLINE) ? INLINE : NO_PROFILES;
+    for (const [profile, errors] of Object.entries(pushes)) {
+      const lines =
+          profile === 'default' ? section(inline) : profileSection(profile);
+      expect({label, profile, errors: rejects(lines)})
+          .toEqual({label, profile, errors});
+    }
   }
 
   beforeEach(() => {
@@ -1197,17 +1232,22 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
          async () => {
            writeScope(
                {
-                 'commerce.yaml': commerce().replace(
-                     'to_columns: [c_id]', 'to_columns: [c_email]'),
+                 'commerce.yaml': joinOnEmail(commerce()),
                  'commerce.profile.prod.yaml': profileFile('prod'),
                },
                defaultProfile);
-           expect(await pushResult('prod')).toEqual({code: 0, errors: []});
+           // A push of prod fails on the model file's join too. The profile
+           // comparison reports it, so its message differs from push's own.
+           const prod = await pushResult('prod');
+           expect(prod).toEqual(
+               {code: 1, errors: [compared('the model file', 'c_email')]});
            const pushed = await pushResult('default');
-           expect(pushed.errors).toEqual(
-               [expect.stringContaining("(commerce): its to_columns")]);
+           expect(pushed).toEqual(
+               {code: 1, errors: [own('commerce', 'c_email')]});
            expect(await profiles()).toBe(1);
-           expect(errs.some(l => l.includes("profile 'prod'"))).toBe(false);
+           const marker = defaultProfile === 'prod' ? ' (default)' : '';
+           expect(rejects(section(`  profile 'prod'${marker}`)))
+               .toEqual(prod.errors);
            expect(rejects(section(INLINE))).toEqual(pushed.errors);
          });
   }
@@ -1502,6 +1542,11 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
   // Push checks every named profile the model declares, whichever binding it
   // deploys.
   describe('push checks every named profile', () => {
+    // `profile` with its prod tables on AlloyDB.
+    const onAlloy = (profile: string) => profile.replaceAll(
+        BQ('prod', ''),
+        '//alloydb.googleapis.com/projects/acme/locations/us/clusters/c/' +
+            'databases/db/schemas/public/tables/');
     const STAGING = `name: staging\nentities:\n  - name: customer\n    source: ${
         BQ('staging', 'customer')}\n`;
     const incomplete = (file: string) => [
@@ -1511,6 +1556,15 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
           "columns in this profile; a named profile states both " +
           "'from_columns' and 'to_columns' itself",
     ];
+    // Expects one error from every binding.
+    const everyPush = (e: string) =>
+        expectPushes({default: [e], a: [e], b: [e]});
+    // The error when profiles a and b give keyless purchase primary keys of
+    // one and two columns.
+    const KEY_SHAPES = "[commerce] entity 'purchase' has no key in the model " +
+        'file, and its profiles disagree on one (a: primary key of 1, unique ' +
+        'keys []; b: primary key of 2, unique keys []); every profile states ' +
+        'keys of one shape, or none does';
 
     test('when the push deploys another binding', async () => {
       writeScope({
@@ -1666,6 +1720,18 @@ relationships:
       });
     });
 
+    test('when the profiles disagree on a keyless entity\'s keys', async () => {
+      const table = BQ('prod', 'purchase');
+      const purchaseKey = (name: string, key: string) => profileFile(name)
+          .replace(table, `${table}\n    primary_key: [${key}]`);
+      writeScope({
+        'commerce.yaml': commerce().replace('        primary_key: [p_id]\n', ''),
+        'commerce.profile.a.yaml': purchaseKey('a', 'p_id'),
+        'commerce.profile.b.yaml': purchaseKey('b', 'p_id, p_line'),
+      });
+      await everyPush(KEY_SHAPES);
+    });
+
     // The rules push leaves out for the profile it applies still run on
     // every other profile.
     test('and checks every rule on a profile the push does not apply', async () => {
@@ -1797,9 +1863,6 @@ entities:
     // the check of an AlloyDB profile reads the ALLOYDB one, so push alone
     // warns that it cannot read that entry.
     test('and warns once for a model file entry in another dialect that the parser cannot read', async () => {
-      const AL = (t: string) =>
-          '//alloydb.googleapis.com/projects/acme/locations/us/clusters/c/' +
-          `databases/db/schemas/public/tables/${t}`;
       writeScope({
         'commerce.yaml': commerce().replace(
             '          - { name: c_id, expression: c_id }\n',
@@ -1809,9 +1872,7 @@ entities:
                 '              dialects:\n' +
                 '                - { dialect: BIGQUERY, expression: c_name }\n' +
                 '                - { dialect: ALLOYDB, expression: "LOWER(c_name" }\n'),
-        'commerce.profile.alloy.yaml': profileFile('alloy')
-                                           .replace(BQ('prod', 'customer'), AL('customer'))
-                                           .replace(BQ('prod', 'purchase'), AL('purchase')),
+        'commerce.profile.alloy.yaml': onAlloy(profileFile('alloy')),
       });
       const warn = spyOn(console, 'warn').mockImplementation(() => {});
       expect(await pushResult()).toEqual({code: 0, errors: []});
@@ -1844,6 +1905,69 @@ entities:
       expect(await pushResult()).toEqual({code: 0, errors: []});
       expect((await pushResult('prod')).errors).toEqual(
           [expect.stringContaining("declares a 'sql' executor")]);
+    });
+
+    // The comparison skips what push's key check or the completeness check
+    // reports, and what push's key check may misread. It compares no join
+    // until the hierarchy resolves.
+    test('and reports each key and join problem at most once', async () => {
+      const model = (targets = 0) => joinOnEmail(commerce({targets}));
+      const unknown = (binding: string) =>
+          `model 'commerce' (${binding}): entity 'customer' extends unknown ` +
+          "entity 'nope'; it is not defined in the model. Checks that need " +
+          'the resolved model are skipped until this is fixed.';
+      const file = 'commerce.profile.staging.yaml';
+      const cases: Array<
+          [string, Record<string, string>, Record<string, string[]>]> = [
+        ['the model file alone', {'commerce.yaml': model()},
+         {default: [own('commerce', 'c_email')]}],
+        ['a profile with no join, so push checks the model file\'s', {
+          'commerce.yaml': model(),
+          [file]: profileFile('staging').replace(/relationships:[\s\S]*/, ''),
+        }, {
+          staging: [
+            incomplete(file)[1],
+            own("commerce, profile 'staging'", 'c_email'),
+          ],
+        }],
+        ['a legacy wrapper that excludes the key field', {
+          'commerce.yaml': model(1),
+          'commerce.profiles/legacy.yaml': legacyProfile(false).replace(
+              /source: .*/, 'fields_exclude: [c_id]'),
+          'commerce.profiles/staging.yaml': profileFile('staging'),
+        }, {legacy: [own("commerce, profile 'legacy'", 'c_email')]}],
+        ['profile a\'s own join', {
+          'commerce.yaml': commerce(),
+          'commerce.profile.a.yaml': profileFile('a').replace(
+              'to_columns: [c_id]', 'to_columns: ["`c_name`"]'),
+        }, {
+          a: [own("commerce, profile 'a'", '`c_name`')],
+          default: [compared("profile 'a'", '`c_name`')],
+        }],
+        ['an AlloyDB key field bound to "c_id", which push may misread', {
+          'commerce.yaml': commerce()
+              .replace('primary_key: [c_id]', 'primary_key: [c_key]')
+              .replace('name: c_id,', 'name: c_key,'),
+          'commerce.profile.x.yaml': onAlloy(profileFile('x', 'c_key')).replace(
+              '    primary_key', '    fields:\n      - { name: c_key, ' +
+                  'expression: {dialects: [{dialect: ALLOYDB, expression: ' +
+                  '\'"c_id"\'}]} }\n    primary_key'),
+        }, {x: [own("commerce, profile 'x'", 'c_id')], default: []}],
+        ['customer extends an unknown entity, so no join is compared', {
+          'commerce.yaml': commerce().replace(
+              'name: customer\n', 'name: customer\n        extends: [nope]\n'),
+          'commerce.profile.a.yaml': profileFile('a'),
+          'commerce.profile.b.yaml': joinOnEmail(profileFile('b')),
+        }, {
+          default: [unknown('commerce')],
+          a: [unknown("commerce, profile 'a'")],
+        }],
+      ];
+      for (const [label, files, pushes] of cases) {
+        fs.rmSync(path.join(dir, 'catalog'), {recursive: true, force: true});
+        writeScope(files);
+        await expectPushes(pushes, label);
+      }
     });
 
     // Actions are out of scope for the preview, so the actions of a profile
@@ -2699,6 +2823,17 @@ semantic_model:
         writeScope({'commerce.yaml': vanilla([complete('prod'), staging])});
         expect(await pushResult('prod'))
             .toEqual({code: 1, errors: incomplete('commerce')});
+      });
+
+      // Push compares the block profiles with each other, as it compares
+      // profile files.
+      test('compares them with each other', async () => {
+        const [a, b]: any[] = [complete('a'), complete('b')];
+        a.entities[1].primary_key = ['p_id'];
+        b.entities[1].primary_key = ['p_id', 'p_line'];
+        writeScope({'commerce.yaml': vanilla([a, b]).replace(
+            '        primary_key: [p_id]\n', '')});
+        await everyPush(KEY_SHAPES);
       });
 
       // Each model in a scope may declare its profiles in either form. A
