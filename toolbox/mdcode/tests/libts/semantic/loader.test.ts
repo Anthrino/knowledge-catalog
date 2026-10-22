@@ -2048,6 +2048,45 @@ describe('vanilla: GOOGLE blocks are read into the model', () => {
       "metric, or set the document version to '0.2.0.dev0/google'.");
   });
 
+  test('a native extends or abstract key on a vanilla dataset fails, naming the dataset and the fix', () => {
+    for (const ext of [['Party'], 'Party']) {
+      expect(() => load(VANILLA, fullModel('dataset', { extends: ext }))).toThrow(
+        "dataset 'orders': 'extends' is a '0.2.0.dev0/google' extension. " +
+        "Set 'extends' in a GOOGLE custom_extensions block on the dataset, " +
+        "or set the document version to '0.2.0.dev0/google'.");
+    }
+
+    const m = fullModel();
+    m.datasets.push({
+      name: 'Party',
+      abstract: true,
+      fields: [{ name: 'id', datatype: 'String' }],
+    });
+    expect(() => load(VANILLA, m)).toThrow(
+      "dataset 'Party': 'abstract' is a '0.2.0.dev0/google' extension. " +
+      "An abstract dataset has no table, and every '0.2.0.dev0' dataset " +
+      "needs a 'source'. A model that needs an abstract entity uses " +
+      "'0.2.0.dev0/google'.");
+
+    // Beside a source, any value gets this error and not the Google flavor's.
+    // An extends on the same dataset does not hide it.
+    for (const patch of [{ abstract: false }, { abstract: true, extends: ['Party'] }]) {
+      let thrown = '';
+      try {
+        load(VANILLA, fullModel('dataset', patch));
+      } catch (err: any) {
+        thrown = err.message;
+      }
+      expect(thrown).toContain(
+        "dataset 'orders': 'abstract' is a '0.2.0.dev0/google' extension.");
+      expect(thrown).not.toContain("remove 'source'");
+    }
+
+    // In the Google flavor, extends is still a list.
+    expect(() => load(GOOGLE, fullModel('dataset', { extends: 'Party' as any }))).toThrow(
+      'expected array, received string');
+  });
+
   test("a 'Google' block is a third-party block: neither read nor removed", () => {
     const block = { vendor_name: 'Google', data: '{"entity": "nope", "abstract": true}' };
     for (const level of ['dataset', 'metric'] as const) {
@@ -3623,15 +3662,37 @@ describe('deployments and inline profiles', () => {
     expect(models[0].deployments).toEqual([{ name: 'default', target: BQ_TARGET }]);
   });
 
-  test('an inline profiles key in a Google-flavor document is rejected, naming the sidecar file', () => {
+  test('an inline profiles key is rejected in both flavors, naming the model and where profiles go', () => {
+    const datasets = [{ name: 'orders', source: 'bigquery.googleapis.com/projects/acme/datasets/raw/tables/orders', primary_key: ['id'], fields: [] }];
     expect(() => load(GOOGLE, {
       name: 'sales',
       profiles: {
         bq: { datasets: [{ name: 'orders', source: 'bigquery.googleapis.com/projects/acme/datasets/raw/tables/orders' }] },
       },
-      datasets: [{ name: 'orders', source: 'bigquery.googleapis.com/projects/acme/datasets/raw/tables/orders', primary_key: ['id'], fields: [] }],
+      datasets,
     })).toThrow(
       "model 'sales': inline 'profiles' are not supported in a '0.2.0.dev0/google' document; write each binding profile in its own sidecar file 'sales.profile.<name>.yaml'.",
+    );
+
+    expect(() => load(VANILLA, {
+      name: 'sales',
+      profiles: [{ name: 'prod', entities: [{ name: 'orders', source: 'bigquery.googleapis.com/projects/acme/datasets/raw/tables/orders' }] }],
+      datasets,
+    })).toThrow(
+      "model 'sales': 'profiles' is not in the open format ('0.2.0.dev0'); " +
+      "list 'profiles' in a GOOGLE custom_extensions block on the model, " +
+      "or set version: '0.2.0.dev0/google' and write each binding profile " +
+      "in its own sidecar file 'sales.profile.<name>.yaml'.",
+    );
+
+    expect(() => load(VANILLA, {
+      profiles: [{ name: 'prod' }],
+      datasets,
+    })).toThrow(
+      "model: 'profiles' is not in the open format ('0.2.0.dev0'); list " +
+      "'profiles' in a GOOGLE custom_extensions block on the model, or set " +
+      "version: '0.2.0.dev0/google' and write each binding profile in its " +
+      "own sidecar file '<model>.profile.<name>.yaml'.",
     );
   });
 });
@@ -3675,6 +3736,9 @@ ${extra}    ${key}:
      "'deployments' is not in the open format"],
     ['inline profiles in the Google flavor', doc(GOOGLE, `    profiles:\n      - name: prod\n`),
      "inline 'profiles' are not supported"],
+    ['inline profiles in the open format',
+     doc('0.2.0.dev0', `    profiles:\n      - name: prod\n`, 'datasets'),
+     "'profiles' is not in the open format ('0.2.0.dev0')"],
     ['two deployments with one target', doc(GOOGLE, `    deployments:\n      - { name: a, target: "${G}" }\n      - { name: b, target: "${G}" }\n`),
      'target the same resource'],
   ];
