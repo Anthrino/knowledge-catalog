@@ -163,6 +163,9 @@ function runScenario(scenario: any) {
       if (scenario.assert?.catalog?.entries) {
         expect(JSON.parse(JSON.stringify(catalog.mockEntries))).toEqual(JSON.parse(JSON.stringify(scenario.assert.catalog.entries)));
       }
+      if (scenario.assert?.catalog?.lookupAspectTypes) {
+        expect(catalog.lookupAspectTypes).toEqual(scenario.assert.catalog.lookupAspectTypes);
+      }
     });
   });
 }
@@ -216,9 +219,9 @@ function main() {
   );
 
   spyOn(gcp.CatalogClient.prototype, 'lookupEntry').mockImplementation(
-    async function(project: string, location: string, entry: string) {
+    async function(project: string, location: string, entry: string, aspects?: string[]) {
       if (currentCatalogMock) {
-        return await currentCatalogMock.lookupEntry(project, location, entry);
+        return await currentCatalogMock.lookupEntry(project, location, entry, aspects);
       }
       return { status: 404, message: 'Not found' };
     }

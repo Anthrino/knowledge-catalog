@@ -22,6 +22,8 @@ export class CatalogClientMock extends gcp.CatalogClient {
   public mockEntryGroups: Map<string, gcp.EntryGroup> = new Map();
   public mockEntryTypes: Map<string, gcp.EntryType> = new Map();
   public mockAspectTypes: Map<string, gcp.AspectType> = new Map();
+  // The aspect types the last lookupEntry call asked for.
+  public lookupAspectTypes?: string[];
 
   constructor() {
     super(TEST_API_CONTEXT);
@@ -81,11 +83,15 @@ export class CatalogClientMock extends gcp.CatalogClient {
   }
 
   async lookupEntry(project: string, location: string, name: string, aspects?: string[]): Promise<gcp.ApiResult<gcp.Entry>> {
+    this.lookupAspectTypes = aspects;
     const entry = this.mockEntries.find(e => e.name == name);
-    if (entry) {
-      return { status: 200, result: entry };
+    if (!entry) {
+      return { status: 404, message: 'Not found' };
     }
-    return { status: 404, message: 'Not found' };
+    // As Dataplex does: only the aspects of the requested types, none when no type is requested.
+    const kept = Object.entries(entry.aspects ?? {})
+        .filter(([, a]) => aspects?.includes(a.aspectType ?? ''));
+    return { status: 200, result: { ...entry, aspects: Object.fromEntries(kept) } };
   }
 
   async modifyEntry(project: string, location: string, entry: gcp.Entry, updateMask?: string[], aspectKeys?: string[]): Promise<gcp.ApiResult<gcp.Entry>> {
