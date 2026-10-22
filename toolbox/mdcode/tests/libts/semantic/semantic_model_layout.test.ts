@@ -356,18 +356,18 @@ describe('SemanticModelLayout profile file rules', () => {
       writeToGroup('retail.yaml', `version: 0.2.0.dev0/google\nsemantic_model:\n${model}`);
       expect((await layout('eg')).profileDocuments('retail').map(d => d.name))
           .toEqual(['prod']);
-      writeToGroup('retail.yaml', `version: 0.2.0.dev0\nsemantic_model:\n${model}`);
-      const l = await layout('eg');
-      expect(() => l.profileDocuments('retail'))
-          .toThrow("sits beside 'retail.yaml', which is a 0.2.0.dev0 document");
     }
+    // The version is still read past a key set twice.
+    writeToGroup('retail.yaml', 'version: 0.2.0.dev0\nsemantic_model:\n  - name: retail\n    name: sales\n');
+    const l = await layout('eg');
+    expect(() => l.profileDocuments('retail'))
+        .toThrow("sits beside 'retail.yaml', which is a 0.2.0.dev0 document");
   });
 
   // The layout reads the version as the lookup of block profiles reads it. A
-  // version set twice, or one a YAML error may change or hide, is not read past
-  // the error, so the file is not taken as vanilla, and the lookup reports the
-  // error. A version set once is read past
-  // an error after it, such as more aliases than a load expands.
+  // version set twice, or one past a YAML syntax error, is not read, so the
+  // file is not taken as vanilla, and the lookup reports the error. A version
+  // set once is read past more aliases than a load expands.
   test('the version of a model file that is not valid YAML is read as the block profile lookup reads it', async () => {
     writeToGroup('retail.profile.prod.yaml', 'name: prod\n');
     const rest = 'semantic_model:\n  - name: retail\n';
@@ -380,6 +380,13 @@ describe('SemanticModelLayout profile file rules', () => {
       // left open ahead of it.
       '{version: "0.2.0.dev0", /google, label: "\nsemantic_model: [{name: retail}]}\n',
       'label: "\n  version: \'0.2.0.dev0/google\'\n  note: "\nversion: "0.2.0.dev0"\nx: "\n' + rest,
+      // A quote closed too early on the version, with the rest of the version
+      // on a line after it, after a `#` with no space before it, or after a
+      // lone carriage return.
+      'version: "0.2.0.dev0"\n  /google"\n' + rest,
+      'version: "0.2.0.dev0"\n\n/google"\n' + rest,
+      'version: "0.2.0.dev0"#/google"\n' + rest,
+      'version: "0.2.0.dev0"\r/google"\n' + rest,
     ]) {
       writeToGroup('retail.yaml', text);
       expect((await layout('eg')).profileDocuments('retail').map(d => d.name))
