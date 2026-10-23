@@ -16,6 +16,7 @@
 
 import {describe, expect, mock, spyOn, test} from 'bun:test';
 
+import type {OverviewSidecar} from '../../../src/libts/layouts/semantic-model';
 import {DataType, Entity, SemanticModel} from '../../../src/libts/semantic/ir';
 import {semanticLinkId} from '../../../src/libts/semantic/kc_ids';
 import {generateCatalogResources, KcGenerateOptions} from '../../../src/libts/semantic/knowledge_catalog';
@@ -69,8 +70,10 @@ const load = (text: string): SemanticModel =>
 // Loads the profile `name` whose other keys are the YAML `body`.
 const PROFILE = (name: string, body: string) =>
     loadProfileFile(`name: ${name}\n${body}`, name);
-// The data of a guidelines aspect.
+// The data of a guidelines aspect and of an overview aspect.
 const GUIDE = (instructions: string) => ({instructions, userManaged: true});
+const EXAMPLES = (...texts: string[]) =>
+    ({examples: texts.map(content => ({content}))});
 // A YAML entity over table p.d.<name> with an `id` field and the given key.
 const ENTITY_YAML = (name: string, key = '[id]') => `      - name: ${name}
         source: ${TABLE(name)}
@@ -1533,6 +1536,40 @@ ${ENTITY_YAML('orders')}
          });
        });
 
+  test('examples land in overview as content records, in order, with no ' +
+           'title or content type, beside what the entry\'s sidecar holds, ' +
+           'and nowhere with neither',
+       () => {
+         const model = loaded();
+         model.metrics[1].aiContext = {examples: []};
+         expect(metric(model, 'order_count', 'overview')).toBeUndefined();
+         model.aiContext!.examples = ['Total sales last month?', 'By region'];
+         model.metrics[1].aiContext = {examples: ['How many orders?']};
+         expect(data(model, 'sales', 'overview'))
+             .toEqual(EXAMPLES('Total sales last month?', 'By region'));
+         expect(metric(model, 'order_count', 'overview'))
+             .toEqual(EXAMPLES('How many orders?'));
+         // A sidecar fills the rest of the instance, an empty one adds
+         // nothing, and one with no entry warns.
+         const sidecar = {content: '# Sales', contentType: 'MARKDOWN',
+                          links: [{url: 'https://wiki/sales', title: 'Wiki'}]};
+         const opts = {...V2, overviews: new Map<string, OverviewSidecar>([
+           ['sales', sidecar], ['sales/metrics/revenue', {content: 'Net.'}],
+           ['sales/metrics/opaque_metric', {}],
+           ['sales/metrics/gone', {content: 'Old.'}],
+         ])};
+         expect(data(model, 'sales', 'overview', opts)).toEqual({
+           ...sidecar, ...EXAMPLES('Total sales last month?', 'By region'),
+         });
+         expect(metric(model, 'revenue', 'overview', opts))
+             .toEqual({content: 'Net.'});
+         expect(metric(model, 'opaque_metric', 'overview', opts))
+             .toBeUndefined();
+         expect(generateCatalogResources(model, opts).warnings).toContain(
+             'sidecar \'sales/metrics/gone.overview.md\' names no entry of ' +
+             'this model; it is not pushed');
+       });
+
   test('guidelines holds the instructions and, in data, the custom ' +
            'ai_context members as loaded, and is left out when an object ' +
            'has neither',
@@ -1592,6 +1629,7 @@ ${ENTITY_YAML('addresses')}
         ai_context:
           instructions: Join through this edge to reach customer attributes.
           synonyms: [placed_by]
+          examples: [Which customer placed order 42?]
         custom_extensions:
           - {vendor_name: DBT, data: '{"relationship": true}'}
       - { name: Order_Billing, from: orders, to: customers,
@@ -1605,8 +1643,8 @@ ${ENTITY_YAML('addresses')}
       data(model, `sales/relationships/${name}`, 'semantic-relationship');
 
   test('a relationship entry sits under the model and holds its ' +
-           'endpoints, any join columns as written, synonyms, instructions ' +
-           'and third-party blocks, and no schema or sql-expressions',
+           'endpoints, any join columns as written, synonyms, instructions, ' +
+           'third-party blocks and examples, and no schema or sql-expressions',
        () => {
          const model = loaded();
          const {entryType, parentEntry, entrySource, aspects} =
@@ -1628,6 +1666,12 @@ ${ENTITY_YAML('addresses')}
            customExtensions:
                [{vendorName: 'DBT', data: '{"relationship": true}'}],
          });
+         const id = 'sales/relationships/orders_to_customers';
+         const opts = {...V2, overviews: new Map([[id, {content: 'Edge.'}]])};
+         expect(data(model, id, 'overview', opts)).toEqual({
+           content: 'Edge.', ...EXAMPLES('Which customer placed order 42?'),
+         });
+         expect(generateCatalogResources(model, opts).warnings).toEqual([]);
          expect(aspects![KEY('schema')]).toBeUndefined();
          expect(aspects![KEY('sql-expressions')]).toBeUndefined();
          expect(rel(model, 'customer_address')).toEqual({

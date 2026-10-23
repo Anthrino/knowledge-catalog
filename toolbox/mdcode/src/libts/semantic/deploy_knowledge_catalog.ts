@@ -22,7 +22,8 @@
 //     and that each file copy fits in one aspect, snapshots the destination
 //     entry group to guard against foreign models (unless `--force-remove` is
 //     set), and checks that any required custom entry/aspect types exist in
-//     the target project.
+//     the target project. With the second-generation aspects, it also checks
+//     every aspect's size.
 //   * Apply creates or updates each model's entries in dependency order: the
 //     `semantic-model` anchor first, then independent child entries
 //     concurrently, and finally dependent child entries (`semantic-metric` and
@@ -49,7 +50,8 @@
 import {ApiResult} from '../gcp/api';
 import * as context from '../gcp/context';
 import * as crm from '../gcp/crm';
-import {CatalogClient, Entry, EntryLink} from '../gcp/dataplex';
+import {Aspect, CatalogClient, Entry, EntryLink} from '../gcp/dataplex';
+import type {OverviewSidecar} from '../layouts/semantic-model';
 
 import {collectCustomTypes, customTypeHome, FILE_COPY_TYPE_ID, FileCopy, PUSH_ID_LABEL} from './kc_custom_types';
 import {anchorId, collectEntityNames, collectOwnedEntries, collectOwnedReferences, entryAspectKeys, entryId, entryTypeId, isAnchorEntry, isDependentEntry, isEntryOwner, isLinkOwner, isModelLink, KcAnchor, linkId, linkTypeId, sameLinkReferences,} from './kc_entries';
@@ -79,15 +81,13 @@ export interface KcDeployOptions {
   emitExpressions?: boolean;
   // Emit the second-generation built-in aspect fields and entry-id layout
   // (selected via KC_V2_ASPECTS=1). Off by default (absent means false).
-  // Consumed by `emitModels` when called through `preflightKnowledgeCatalog` or
-  // `deployKnowledgeCatalog`, and by `updateEntry` when computing `aspectKeys`
-  // (including when called through `deployEmittedModels`, which takes
-  // already-emitted resources from an origin with its own emitter).
   v2Aspects?: boolean;
   // The file copies of the model file and its profile files, which the
-  // emitter stores when v2Aspects is off. Consumed by `emitModels` like
-  // v2Aspects.
+  // emitter stores when v2Aspects is off.
   sourceFiles?: FileCopy[];
+  // The overview sidecar of each entry, by entry id, which the emitter writes
+  // into the entry's overview when v2Aspects is on.
+  overviews?: ReadonlyMap<string, OverviewSidecar>;
   // Set when the caller has already checked that the file-copy type exists
   // in the destination project. The preflight then does not look that type
   // up again. It still looks up every other custom type the model uses.
@@ -196,6 +196,7 @@ function sleep(ms: number): Promise<void> {
  *      `opts.fileCopyTypeChecked` is set.
  *   5. Returns the emitted resources, entry-group listing, warnings, and plan
  *      as `prepared` for `applyKnowledgeCatalog`.
+ * With `opts.v2Aspects` set, step 2 also checks every aspect's size.
  */
 export async function preflightKnowledgeCatalog(
     models: LoadedModel[], ctx: context.ApiContext, opts: KcDeployOptions):
@@ -321,9 +322,10 @@ export async function deployEmittedModels(
  * Runs read-only preflight checks on already-emitted models.
  *
  * The method performs the following checks:
- *   1. Validates locally that `emitted` contains a single model and that each
- *      file copy fits in one aspect, builds the dry-run plan, and returns
- *      early when `opts.validateOnly` is set.
+ *   1. Validates locally that `emitted` contains a single model, that each
+ *      file copy fits in one aspect and, with `opts.v2Aspects` set, that every
+ *      aspect fits. Builds the dry-run plan and returns early when
+ *      `opts.validateOnly` is set.
  *   2. Lists the destination entry group and validates that it contains no
  *      foreign models unless `--force-remove` is set.
  *   3. Validates that every custom type used by the model exists in the
@@ -353,6 +355,8 @@ async function preflightEmittedModels(
   const model = emitted[0];
   const sizeValidation = validateFileCopySizes(model, result);
   if (!sizeValidation.success) return {result: sizeValidation};
+  const aspectsError = opts.v2Aspects ? emittedAspectsError(model) : undefined;
+  if (aspectsError) return {result: result(false, aspectsError)};
   plan = buildPlan(emitted, opts);
   if (opts.validateOnly) return {result: result(true)};
 
@@ -455,6 +459,7 @@ function validateEntryGroup(
 // The largest aspect data Dataplex accepts: 120 KiB of its JSON form, in UTF-8
 // bytes, with escaping counted. The schema aspect may hold 2 MiB.
 export const MAX_ASPECT_DATA_BYTES = 120 * 1024;
+const MAX_SCHEMA_ASPECT_DATA_BYTES = 2 * 1024 * 1024;
 
 /**
  * Validates that every file copy in `model` fits in one aspect.
@@ -507,6 +512,67 @@ function fileCopySizeError(data: Record<string, any>): string|undefined {
   return `file '${data.fileName}' is too large to store in Knowledge ` +
       `Catalog: its copy takes ${bytes} bytes, and one aspect holds at most ` +
       `${MAX_ASPECT_DATA_BYTES}.`;
+}
+
+/**
+ * The emitter's warnings for `models` with v2Aspects on, and why push's
+ * catalog leg cannot write them: an emit error or an aspect too large to
+ * store. Calls no service.
+ */
+export function checkCatalogAspects(
+    models: LoadedModel[],
+    opts: KcDeployOptions): {error?: string; warnings: string[]} {
+  const emit = emitModels(models, opts);
+  const error =
+      emit.error ?? emit.emitted.map(emittedAspectsError).find(e => e);
+  return {error, warnings: emit.warnings};
+}
+
+// Why push cannot write what `model` emits, or undefined when it can.
+function emittedAspectsError(model: EmittedModel): string|undefined {
+  for (const entry of model.resources.entries) {
+    const error = aspectDataError(entry.aspects, `entry '${entryId(entry)}'`);
+    if (error) return error;
+  }
+  for (const link of model.resources.entryLinks) {
+    const error = aspectDataError(link.aspects, `entry link '${linkId(link)}'`);
+    if (error) return error;
+  }
+  return undefined;
+}
+
+// Why Knowledge Catalog cannot store one of `aspects`, which `owner` carries,
+// or undefined when each fits.
+function aspectDataError(
+    aspects: Record<string, Aspect>|undefined, owner: string): string|
+    undefined {
+  for (const [key, aspect] of Object.entries(aspects ?? {})) {
+    const type = aspectTypeIdOfKey(key);
+    const bytes = storedJsonBytes(aspect.data ?? {});
+    const limit = type === 'schema' ? MAX_SCHEMA_ASPECT_DATA_BYTES :
+                                      MAX_ASPECT_DATA_BYTES;
+    if (bytes > limit) {
+      return `aspect '${key}' of ${owner} is too large to store in ` +
+          `Knowledge Catalog: its data takes ${bytes} bytes, and one ` +
+          `aspect holds at most ${limit}.`;
+    }
+  }
+  return undefined;
+}
+
+// The UTF-8 bytes of `data`'s JSON as Dataplex counts them. Dataplex writes
+// < > & = ' U+2028 and U+2029 as six-byte \uXXXX escapes.
+function storedJsonBytes(data: unknown): number {
+  const json = JSON.stringify(data);
+  return new TextEncoder().encode(json).length +
+      5 * (json.match(/[<>&=']/g)?.length ?? 0) +
+      3 * (json.match(/[\u2028\u2029]/g)?.length ?? 0);
+}
+
+// The aspect type id in an aspect key, `<project>.<location>.<type>` with an
+// optional `@<path>`.
+function aspectTypeIdOfKey(key: string): string {
+  return key.split('@')[0].split('.').pop() ?? '';
 }
 
 /**
@@ -591,6 +657,7 @@ function emitModels(models: LoadedModel[], opts: KcDeployOptions):
         emitExpressions: opts.emitExpressions,
         v2Aspects: opts.v2Aspects,
         sourceFiles: opts.sourceFiles,
+        overviews: opts.overviews,
       });
     } catch (err: any) {
       return {

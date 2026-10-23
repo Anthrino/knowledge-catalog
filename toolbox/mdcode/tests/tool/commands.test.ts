@@ -1313,19 +1313,55 @@ semantic_model:
          expect(fs.readFileSync(rebuilt, 'utf8')).toContain('name: commerce');
        });
 
-  // Push still reads each profile file, to check it.
-  test('with KC_V2_ASPECTS on, push stores no copy', async () => {
-    process.env.KC_V2_ASPECTS = '1';
-    writeRoundTripWorkspace();
-    const {entries} = fakeCatalog();
-    expect(await push({profile: false})).toBe(0);
-    expect(storedCopies(entries)).toEqual({});
+  // Push still reads each profile file, to check it. Both push paths write
+  // each overview sidecar into its entry's overview aspect, and a malformed
+  // sidecar stops them before they read the catalog.
+  test('with KC_V2_ASPECTS on, push stores no copy and writes the overview ' +
+           'sidecars, with --no-deployment too; a malformed sidecar or ' +
+           'profile file fails it',
+       async () => {
+         process.env.KC_V2_ASPECTS = '1';
+         writeRoundTripWorkspace();
+         const write = (name: string, text: string) => {
+           fs.mkdirSync(path.dirname(path.join(entryGroupDir(), name)),
+                        {recursive: true});
+           fs.writeFileSync(path.join(entryGroupDir(), name), text);
+         };
+         write('commerce.overview.md',
+               '---\ncontentType: MARKDOWN\n---\n# Commerce\n');
+         const {entries, create, list} = fakeCatalog();
+         const pushes = [{profile: false}, {deployment: false}];
+         for (const options of pushes) {
+           expect(await push(options)).toBe(0);
+           expect(storedCopies(entries)).toEqual({});
+           expect(entries
+                      .get('projects/test-project/locations/us/entryGroups/' +
+                           'commerce_eg/entries/commerce')!
+                      .aspects!['dataplex-types.global.overview'].data)
+               .toEqual({content: '# Commerce', contentType: 'MARKDOWN'});
+         }
 
-    writeRoundTripWorkspace('name: [unterminated\n');
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    expect(await push({profile: false})).toBe(1);
-    expect(messages(errorSpy)).toContain('commerce.profile.prod.yaml');
-  });
+         write('commerce/metrics/revenue.overview.md',
+               '---\ncontentType: TEXT\n---\nNet.\n');
+         const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+         for (const options of pushes) {
+           list.mockClear();
+           create.mockClear();
+           errorSpy.mockClear();
+           expect(await push(options)).toBe(1);
+           expect(messages(errorSpy)).toBe(
+               'Error: Overview sidecar ' +
+               "'commerce/metrics/revenue.overview.md': contentType is " +
+               "MARKDOWN or HTML, not 'TEXT'.");
+           expect(list).not.toHaveBeenCalled();
+           expect(create).not.toHaveBeenCalled();
+         }
+
+         writeRoundTripWorkspace('name: [unterminated\n');
+         errorSpy.mockClear();
+         expect(await push({profile: false})).toBe(1);
+         expect(messages(errorSpy)).toContain('commerce.profile.prod.yaml');
+       });
 });
 
 
@@ -2456,7 +2492,8 @@ ${rest}`;
   const validateNoKc = {validateOnly: true, kc: false};
   const pruned: Array<[
     outcome: string, deployments: string[], rest: string, options: PushOptions,
-    errors: string[], warnings: string[], sources?: string[]]> = [
+    errors: string[], warnings: string[], sources?: string[],
+    v2Aspects?: boolean]> = [
     ['stopped by two deployments', ['a', 'b'], '', {validateOnly: true},
      ["Error: model 'commerce' (commerce) declares 2 deployments; push uses " +
       'exactly one deployment for now, with a BigQuery Graph or Spanner ' +
@@ -2478,11 +2515,21 @@ ${rest}`;
       'could not read its SQL, so the fields it reads were not checked.', NOTE]],
     ['that fails a source check', ['g'], '', validateNoKc,
      ['Error: the table is gone'], [NOTE], ['the table is gone']],
+    ['that passes with KC_V2_ASPECTS on', ['a'], '', {validateOnly: true}, [],
+     [NOTE], [], true],
+    ['stopped by an aspect too large with KC_V2_ASPECTS on', ['a'],
+     `    ai_context:\n      instructions: ${
+         'x'.repeat(kc.MAX_ASPECT_DATA_BYTES)}\n`,
+     {validateOnly: true},
+     [expect.stringContaining("Error: aspect 'dataplex-types.global." +
+                              "guidelines' of entry 'commerce' is too large")],
+     [], [], true],
   ];
-  for (const [outcome, deployments, rest, options, errors, warnings, sources = []]
-       of pruned) {
+  for (const [outcome, deployments, rest, options, errors, warnings,
+              sources = [], v2Aspects = false] of pruned) {
     const note = warnings.includes(NOTE) ? 'its' : 'no';
     test(`a pruned push ${outcome} gives ${note} pruning note`, async () => {
+      if (v2Aspects) process.env.KC_V2_ASPECTS = '1';
       const eg = writeModel(ltvUnbound(deployments, rest));
       if (options.allProfiles) {
         fs.mkdirSync(path.join(eg, 'commerce.profiles'));

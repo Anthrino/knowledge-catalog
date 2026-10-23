@@ -101,6 +101,9 @@ const OPTS = {
 };
 const V2_OPTS = {...OPTS, v2Aspects: true};
 
+// The most data Dataplex stores in an aspect other than schema.
+const LIMIT = 122_880;
+
 // bun's spyOn accumulates calls across tests; restore originals after each so
 // per-test call counts and ordering assertions are isolated.
 afterEach(() => {
@@ -627,7 +630,6 @@ describe('checkFileCopies', () => {
 
 
 describe('deployKnowledgeCatalog: the size of a file copy', () => {
-  const LIMIT = 122_880;
   const NAME = 'sales.yaml';
   // The JSON around the content: `{"fileName":"sales.yaml","content":""}`.
   const ENVELOPE = JSON.stringify({fileName: NAME, content: ''}).length;
@@ -2716,6 +2718,7 @@ describe('deployKnowledgeCatalog: aspect removal on update', () => {
           'dataplex-types.global.semantic-model',
           'dataplex-types.global.guidelines',
           'dataplex-types.global.semantic-extensions',
+          'dataplex-types.global.overview',
         ]);
         expect(modelUpdateCall![3]).toBe(true);
 
@@ -2734,6 +2737,7 @@ describe('deployKnowledgeCatalog: aspect removal on update', () => {
           'dataplex-types.global.sql-expressions',
           'dataplex-types.global.guidelines',
           'dataplex-types.global.semantic-extensions',
+          'dataplex-types.global.overview',
         ]);
         expect(metricUpdateCall![3]).toBe(true);
 
@@ -4136,4 +4140,80 @@ describe('deployKnowledgeCatalog: V2 relationship entries and links', () => {
       expect(result).toMatchObject({success: false, details});
     });
   }
+});
+
+
+describe('deployKnowledgeCatalog: the size of a V2 aspect', () => {
+  type Opts = Parameters<typeof deployKnowledgeCatalog>[2];
+  // Pushes OSSIE with `instructions` on the model and `description` on field
+  // o_orderkey.
+  const push = (instructions: string, opts: Opts = V2_OPTS,
+                description = 'd') =>
+      deployKnowledgeCatalog(models([{
+        name: 'sales.yaml',
+        text: OSSIE
+            .replace('  - name: sales\n', '  - name: sales\n    ai_context: ' +
+                     `{instructions: ${JSON.stringify(instructions)}}\n`)
+            .replace('- name: o_orderkey\n', '- name: o_orderkey\n' +
+                     `            description: ${description}\n`),
+      }]), CTX, opts);
+  // The error for aspect `key` of `owner`, whose data takes `bytes` bytes.
+  const tooLarge = (key: string, owner: string, bytes: number, limit = LIMIT) =>
+      `aspect 'dataplex-types.global.${key}' of ${owner} is too large to ` +
+      `store in Knowledge Catalog: its data takes ${bytes} bytes, and one ` +
+      `aspect holds at most ${limit}.`;
+  // The JSON around the instructions in the guidelines aspect.
+  const ENVELOPE = JSON.stringify({instructions: '', userManaged: true}).length;
+  // Instructions of `ch` just past the limit, where Dataplex stores each `ch`
+  // in `width` bytes, and the error for them.
+  const over = (ch: string, width: number) => {
+    const count = Math.ceil((LIMIT - ENVELOPE) / width) + 1;
+    const bytes = count * width + ENVELOPE;
+    return [ch.repeat(count), tooLarge('guidelines', 'entry \'sales\'', bytes)];
+  };
+
+  // A push that fails lists and writes nothing.
+  for (const [name, [instructions, details], opts, description] of [
+    ['an aspect exactly at the limit fits', ['x'.repeat(LIMIT - ENVELOPE)]],
+    ['an aspect one byte over the limit fails', over('x', 1)],
+    // JSON.stringify writes é in two bytes, < > & = and ' in one and U+2028
+    // and U+2029 in three, and Dataplex writes each of the last seven in six.
+    ['the size counts UTF-8 bytes and Dataplex\'s escapes',
+     over('é<>&=\'\u2028\u2029', 44)],
+    ['a schema aspect over 120 KiB and under 2 MiB fits', ['x'], V2_OPTS,
+     'd'.repeat(LIMIT)],
+    ['a schema aspect over 2 MiB fails',
+     ['x', tooLarge('schema', 'entry \'sales/entities/orders\'', 2_097_352,
+                    2 * 1024 * 1024)],
+     {...V2_OPTS, validateOnly: true}, 'd'.repeat(2 * 1024 * 1024)],
+    ['with the flag off, only file copies are checked', ['x'.repeat(LIMIT)],
+     {...OPTS, validateOnly: true}],
+  ] as [string, string[], Opts?, string?][]) {
+    test(name, async () => {
+      const {list, create} = stubClient();
+      expect(await push(instructions, opts, description))
+          .toMatchObject(details ? {success: false, details} : {success: true});
+      if (details) {
+        expect(list).not.toHaveBeenCalled();
+        expect(create).not.toHaveBeenCalled();
+      }
+    });
+  }
+
+  test('a semantic-link aspect is checked too', async () => {
+    stubClient();
+    const relationships = ['r'.repeat(LIMIT)];
+    const entryLinks = [{
+      ...linkEntry('sales-link', []), entryLinkType: SEMANTIC_LINK_TYPE,
+      aspects: {'dataplex-types.global.semantic-link': {data: {relationships}}},
+    }];
+    const resources =
+        {entries: [], entryLinks, ownedPrefixes: [], warnings: []};
+    const details = tooLarge(
+        'semantic-link', 'entry link \'sales-link\'',
+        LIMIT + JSON.stringify({relationships: ['']}).length);
+    expect(await deployEmittedModels([{model: 'sales', resources}], [], CTX,
+                                     {...V2_OPTS, validateOnly: true}))
+        .toMatchObject({success: false, details});
+  });
 });
