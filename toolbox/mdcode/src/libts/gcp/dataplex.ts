@@ -9,6 +9,8 @@ import * as crm from './crm';
 export interface EntryGroup {
   name: string;
   type?: string;
+  description?: string;
+  etag?: string;
   [key: string]: any;
 }
 
@@ -270,6 +272,23 @@ export class CatalogClient extends api.ApiClient {
     const res = await this._post<EntryGroup>(resourceName, entryGroup, params);
 
     return res;
+  }
+
+  // Patches an existing entry group (such as its description). `updateMask`
+  // defaults to `['description']`. Returns a long-running operation.
+  async updateEntryGroup(project: string, location: string,
+                         entryGroupId: string,
+                         entryGroup: Omit<EntryGroup, 'name'>,
+                         updateMask: string[] = ['description']):
+      Promise<api.ApiResult<Operation>> {
+    const name = catalogContainer(project, location, entryGroupId);
+
+    const params: Record<string, any> = {};
+    if (updateMask && updateMask.length) {
+      params.updateMask = updateMask.join(',');
+    }
+
+    return await this._patch<Operation>(name, entryGroup, params);
   }
 
   // Creates a custom aspect type. `aspectType` carries the display name,

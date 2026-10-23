@@ -699,6 +699,9 @@ semantic_model:
         sales, {project: 'test-project', location: 'us', entryGroup: 'sales_eg'});
     const pulled = modelsFromCatalogResources(entries, entryLinks);
 
+    spyOn(globalThis, 'fetch').mockImplementation((() => {
+      throw new Error('unexpected network call');
+    }) as any);
     spyOn(pullKc, 'pullKnowledgeCatalog').mockResolvedValue(pulled);
 
     const code = await pull();

@@ -11,7 +11,7 @@ import {BigQueryClient} from '../libts/gcp/bigquery';
 import * as context from '../libts/gcp/context';
 import * as dataplex from '../libts/gcp/dataplex';
 import {SpannerClient} from '../libts/gcp/spanner';
-import {fileNameOf, SemanticModelLayout} from '../libts/layouts/semantic-model';
+import {ContextSetOverview, fileNameOf, SemanticModelLayout} from '../libts/layouts/semantic-model';
 import {convertOwlToOsi} from '../libts/semantic/converters/owl/convert';
 import * as deploy from '../libts/semantic/deploy_bigquery';
 import * as kc from '../libts/semantic/deploy_knowledge_catalog';
@@ -40,6 +40,7 @@ export interface InitOptions {
   bigqueryDataset?: string|string[];
   kb?: string;
   semanticModel?: string;
+  description?: string;
   pull?: boolean;
 }
 
@@ -267,9 +268,14 @@ export async function init(options: InitOptions): Promise<number> {
     // entries, never the entry group). Idempotent: an already-existing group
     // (409) is success.
     const catalog = new dataplex.CatalogClient(ctx);
+    const entryGroupBody: Omit<dataplex.EntryGroup, 'name'> = {
+      type: 'context-set',
+      ...(options.description !== undefined ?
+              {description: options.description} :
+              {}),
+    };
     const res = await catalog.createEntryGroup(
-        source.project, source.location, source.entryGroup,
-        {type: 'context-set'});
+        source.project, source.location, source.entryGroup, entryGroupBody);
     // A caller without create permission may be refused the create of an
     // entry group that exists. A lookup tells the two apart.
     const exists = res.status === 409 ||
@@ -297,6 +303,18 @@ export async function init(options: InitOptions): Promise<number> {
     fs.mkdirSync(
         path.join('catalog', 'EntryGroups', source.entryGroup),
         {recursive: true});
+    // Record the initial description locally only when this init created the
+    // entry group; an already-existing group's description is never overwritten
+    // by init.
+    if (res.status === 200 && options.description !== undefined &&
+        !options.pull) {
+      const layout = new SemanticModelLayout('catalog', source.entryGroup);
+      await layout.writeContextSetOverview({
+        description: options.description,
+        baseDescription: options.description,
+        ...(res.result?.etag !== undefined ? {etag: res.result.etag} : {}),
+      });
+    }
   } else {
     console.error(
         'Error: Must provide --entry-group, --bigquery-dataset, --kb, or --semantic-model');
@@ -1366,6 +1384,13 @@ export async function push(options: PushOptions): Promise<number> {
     // (pruned to what it answers); a catalog-only --no-profile push publishes
     // the whole logical model unpruned.
     if (kcEnabled) {
+      let overview: ContextSetOverview|undefined;
+      try {
+        overview = layout.readContextSetOverview();
+      } catch (err: any) {
+        console.error(`Error: ${err.message || err}`);
+        return 1;
+      }
       const prepared = await prepareKc();
       if (!prepared) return 1;
       // Pull writes a model to `<model>.yaml`, so it returns the copy of a
@@ -1380,7 +1405,7 @@ export async function push(options: PushOptions): Promise<number> {
             `file; rename it '${model.name}.yaml' to keep it exact.`);
       }
       const code = await pushKnowledgeCatalog(
-          prepared.models, ctx, options, source, fileCopies);
+          prepared.models, ctx, options, source, fileCopies, layout, overview);
       if (code !== 0) return code;
     } else if (deployedGraphs === 0) {
       // Graph-only push (--no-kc) whose selected profile(s) declare no target:
@@ -1830,11 +1855,42 @@ async function pushSpanner(
 // success).
 async function pushKnowledgeCatalog(
     models: LoadedModel[], ctx: context.ApiContext, options: PushOptions,
-    source: SemanticModelSource, sourceFiles: FileCopy[]): Promise<number> {
+    source: SemanticModelSource, sourceFiles: FileCopy[],
+    layout?: SemanticModelLayout,
+    overview?: ContextSetOverview): Promise<number> {
   console.log(
       options.validateOnly ?
           'Validating semantic model for Knowledge Catalog...' :
           'Pushing semantic model (Knowledge Catalog)...');
+
+  const hasDescriptionChange = overview !== undefined &&
+      overview.description !== overview.baseDescription;
+
+  // When a workspace has no model document yet, allow a push that only updates
+  // the context set description.
+  if (!models.length && hasDescriptionChange && layout && overview) {
+    if (options.print) {
+      console.log('-- Knowledge Catalog --');
+      console.log(
+          `  Context set '${source.name}': update context set description`);
+    }
+    if (options.validateOnly) {
+      console.log(
+          `Context set '${source.name}': would update the context set description.`);
+      console.log('Validation complete; no changes applied.');
+      return 0;
+    }
+    const descErr =
+        await applyContextSetDescription(ctx, source, layout, overview);
+    if (descErr) {
+      console.error(`Error: ${descErr}`);
+      return 1;
+    }
+    console.log(
+        'Wrote 0 new and 0 updated Knowledge Catalog entries; updated the context set description.');
+    return 0;
+  }
+
   // The deploy passes its warnings to `onWarnings` before the first catalog
   // write. A run that stops before then returns them in the result instead.
   // `result.warnings` starts with the warnings `onWarnings` got, because
@@ -1870,6 +1926,10 @@ async function pushKnowledgeCatalog(
     for (const line of result.plan) {
       console.log(line);
     }
+    if (hasDescriptionChange) {
+      console.log(
+          `  Context set '${source.name}': update context set description`);
+    }
   }
 
   if (!result.success) {
@@ -1888,13 +1948,132 @@ async function pushKnowledgeCatalog(
       `; unlinked ${result.unlinked} orphaned link${
           result.unlinked === 1 ? '' : 's'}` :
       '';
-  console.log(
-      options.validateOnly ?
-          'Validation complete; no changes applied.' :
+  if (options.validateOnly) {
+    if (hasDescriptionChange) {
+      console.log(
+          `Context set '${source.name}': would update the context set description.`);
+    }
+    console.log('Validation complete; no changes applied.');
+    return 0;
+  }
+
+  if (hasDescriptionChange && layout && overview) {
+    const descErr =
+        await applyContextSetDescription(ctx, source, layout, overview);
+    if (descErr) {
+      console.log(
           `Wrote ${result.created} new and ${result.updated} updated ` +
-              `Knowledge Catalog entr${n === 1 ? 'y' : 'ies'}${removed}${
-                  linked}${unlinked}.`);
+          `Knowledge Catalog entr${n === 1 ? 'y' : 'ies'}${removed}${
+              linked}${unlinked}.`);
+      console.error(`Error: ${descErr}`);
+      return 1;
+    }
+    console.log(
+        `Wrote ${result.created} new and ${result.updated} updated ` +
+        `Knowledge Catalog entr${n === 1 ? 'y' : 'ies'}${removed}${
+            linked}${unlinked}; updated the context set description.`);
+    return 0;
+  }
+
+  console.log(
+      `Wrote ${result.created} new and ${result.updated} updated ` +
+      `Knowledge Catalog entr${n === 1 ? 'y' : 'ies'}${removed}${
+          linked}${unlinked}.`);
   return 0;
+}
+
+
+// Patches the context set's description on Knowledge Catalog and updates the
+// local `_context_set.overview.yaml` baseline on success. Returns an error
+// message when the update fails, or undefined on success.
+async function applyContextSetDescription(
+    ctx: context.ApiContext, source: SemanticModelSource,
+    layout: SemanticModelLayout,
+    overview: ContextSetOverview): Promise<string|undefined> {
+  const catalog = new dataplex.CatalogClient(ctx);
+  const body: Omit<dataplex.EntryGroup, 'name'> = {
+    description: overview.description,
+    ...(overview.etag !== undefined ? {etag: overview.etag} : {}),
+  };
+  const res = await catalog.updateEntryGroup(
+      source.project, source.location, source.entryGroup, body,
+      ['description']);
+  if (res.status === 403) {
+    return `failed to update context set description for '${source.name}': ` +
+        `missing permission 'dataplex.entryGroups.update'` +
+        (res.message ? ` (${res.message})` : '');
+  }
+  if (res.status === 409 || res.status === 412 ||
+      (res.status === 400 && /etag/i.test(res.message ?? ''))) {
+    return `failed to update context set description for '${source.name}': ` +
+        `etag conflict (the context set was modified in Knowledge Catalog ` +
+        `since the last pull); run 'kcmd pull' and re-apply your change` +
+        (res.message ? ` (${res.message})` : '');
+  }
+  if (res.status !== 200) {
+    return `failed to update context set description for '${source.name}': ` +
+        `${res.message || `HTTP ${res.status}`}`;
+  }
+  const opError = await catalog.awaitOperation(
+      res.result, `updating entry group '${source.name}'`);
+  if (opError) {
+    if (res.result?.error?.code === 10 ||
+        /etag|aborted|conflict/i.test(opError)) {
+      return `failed to update context set description for '${source.name}': ` +
+          `etag conflict (${opError}); run 'kcmd pull' and re-apply your change`;
+    }
+    return `failed to update context set description for '${source.name}': ${
+        opError}`;
+  }
+  const newEtag = (res.result as any)?.response?.etag ??
+      (res.result as any)?.etag ?? overview.etag;
+  await layout.writeContextSetOverview({
+    description: overview.description,
+    baseDescription: overview.description,
+    ...(newEtag !== undefined ? {etag: newEtag} : {}),
+  });
+  return undefined;
+}
+
+
+// Reads the entry group's description and etag from Knowledge Catalog and
+// updates the local `_context_set.overview.yaml` file (or reports the change
+// under --dry-run).
+async function pullContextSetOverview(
+    catalog: dataplex.CatalogClient, source: SemanticModelSource,
+    layout: SemanticModelLayout, options: PullOptions): Promise<void> {
+  let res: Awaited<ReturnType<dataplex.CatalogClient['getEntryGroup']>>|
+      undefined;
+  try {
+    res = await catalog.getEntryGroup(
+        source.project, source.location, source.entryGroup);
+  } catch {
+    // A unit test that stubs pullKnowledgeCatalog without stubbing
+    // getEntryGroup throws from fetch; leave the overview file untouched.
+    return;
+  }
+  if (!res || res.status !== 200 || !res.result) return;
+  const description = res.result.description ?? '';
+  const etag = res.result.etag;
+  if (options.dryRun) {
+    const existing = layout.readContextSetOverview();
+    const state = !existing ?
+        'create' :
+        existing.description === description &&
+                existing.baseDescription === description &&
+                existing.etag === etag ?
+        'unchanged' :
+        'update';
+    if (state !== 'unchanged') {
+      console.log(`  would ${state} ${layout.contextSetOverviewPath()}`);
+    }
+    return;
+  }
+  await layout.writeContextSetOverview({
+    description,
+    baseDescription: description,
+    ...(etag !== undefined ? {etag} : {}),
+  });
 }
 
 
@@ -1936,6 +2115,7 @@ async function pullSemanticModel(
   // A pull returns file copies only with the model they belong to.
   const rawFiles = result.rawFiles ?? [];
   if (!result.models.length) {
+    await pullContextSetOverview(catalog, source, layout, options);
     console.log('No semantic models found; nothing to pull.');
     return 0;
   }
@@ -1975,6 +2155,8 @@ async function pullSemanticModel(
       }
     }
   }
+
+  await pullContextSetOverview(catalog, source, layout, options);
 
   // The file copies are written instead of the model rebuilt from the
   // aspects. Writing both would leave whichever wrote `<model>.yaml` last.
