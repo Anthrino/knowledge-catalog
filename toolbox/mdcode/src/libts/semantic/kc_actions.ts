@@ -71,7 +71,7 @@ export interface ActionEmitContext {
   // emitted (knowledge_catalog.claim).
   claim(entryId: string, label: string): boolean;
   // Names of the entities this push actually publishes an entry for. An
-  // abstract entity, or one a binding profile pruned, is absent, so a
+  // abstract entity under the first-generation types is absent, so a
   // parameter typed by it would name an entry that does not exist.
   publishedEntities: Set<string>;
 }
@@ -92,7 +92,8 @@ export function actionOwnedPrefix(modelId: string): string {
 // it will. Three ways to lose it, and naming which one is the difference
 // between an author deleting the projection and an author binding a column:
 //
-//   - the concept is not published at all (pruned, or abstract);
+//   - the concept is not published at all (an abstract entity under the
+//     first-generation types);
 //   - the concept is published but the FIELD is not -- `pruneUnavailable`
 //     drops an unbound field while keeping the entity whose key still binds,
 //     and a projected parameter no longer prunes its action, so the entry goes
@@ -144,8 +145,8 @@ export function actionEntries(
   const relationshipNames =
       new Set((model.relationships ?? []).map(r => r.name));
 
-  // The fields this push actually writes into a `schema` aspect, which is
-  // what a later pull reads back. Asked of the loader's own resolver so the
+  // The fields of each concept with inheritance resolved, which a later pull
+  // rebuilds from the catalog. Asked of the loader's own resolver so the
   // answer accounts for `extends`; a model that will not resolve returns null
   // and the field half of the check is skipped, since an emitter is not the
   // place to discover that a model does not load.

@@ -16,7 +16,7 @@ import {ApiResult} from '../../../src/libts/gcp/api';
 import {ApiContext} from '../../../src/libts/gcp/context';
 import {fixProject, ResourceManagerClient} from '../../../src/libts/gcp/crm';
 import {CatalogClient} from '../../../src/libts/gcp/dataplex';
-import {applyKnowledgeCatalog, checkFileCopies, deployEmittedModels, deployKnowledgeCatalog, EmittedModel, MAX_ASPECT_DATA_BYTES, preflightKnowledgeCatalog,} from '../../../src/libts/semantic/deploy_knowledge_catalog';
+import {applyKnowledgeCatalog, checkCatalogAspects, checkFileCopies, deployEmittedModels, deployKnowledgeCatalog, EmittedModel, MAX_ASPECT_DATA_BYTES, preflightKnowledgeCatalog,} from '../../../src/libts/semantic/deploy_knowledge_catalog';
 import {semanticLinkId} from '../../../src/libts/semantic/kc_ids';
 import {loadSemanticModels} from '../../../src/libts/semantic/loader';
 
@@ -2709,11 +2709,6 @@ describe('deployKnowledgeCatalog: aspect removal on update', () => {
         expect(metricUpdateCall).toBeDefined();
         expect(actionUpdateCall).toBeDefined();
 
-        expect(
-            entityUpdateCall![0]
-                .aspects?.['dataplex-types.global.sql-expressions'])
-            .toBeUndefined();
-
         expect(modelUpdateCall![2]).toEqual([
           'dataplex-types.global.semantic-model',
           'dataplex-types.global.guidelines',
@@ -2725,10 +2720,13 @@ describe('deployKnowledgeCatalog: aspect removal on update', () => {
         expect(entityUpdateCall![2]).toEqual([
           'dataplex-types.global.semantic-entity',
           'dataplex-types.global.schema',
+          'dataplex-types.global.sql-expressions',
           'dataplex-types.global.guidelines',
           'dataplex-types.global.semantic-extensions',
-          'dataplex-types.global.sql-expressions',
+          'dataplex-types.global.overview',
           'dataplex-types.global.guidelines@*',
+          'dataplex-types.global.semantic-extensions@*',
+          'dataplex-types.global.overview@*',
         ]);
         expect(entityUpdateCall![3]).toBe(true);
 
@@ -4183,7 +4181,7 @@ describe('deployKnowledgeCatalog: the size of a V2 aspect', () => {
     ['a schema aspect over 120 KiB and under 2 MiB fits', ['x'], V2_OPTS,
      'd'.repeat(LIMIT)],
     ['a schema aspect over 2 MiB fails',
-     ['x', tooLarge('schema', 'entry \'sales/entities/orders\'', 2_097_352,
+     ['x', tooLarge('schema', 'entry \'sales/entities/orders\'', 2_097_313,
                     2 * 1024 * 1024)],
      {...V2_OPTS, validateOnly: true}, 'd'.repeat(2 * 1024 * 1024)],
     ['with the flag off, only file copies are checked', ['x'.repeat(LIMIT)],
@@ -4199,6 +4197,26 @@ describe('deployKnowledgeCatalog: the size of a V2 aspect', () => {
       }
     });
   }
+
+  // OSSIE with n more fields on orders, f0 to f<n-1>, each with an example.
+  const wide = (n: number) => models([{
+    name: 'sales.yaml',
+    text: OSSIE.replace('- name: o_orderkey\n', Array.from(
+        {length: n}, (_, i) => `- { name: f${i}, expression: f${i}, ` +
+            'ai_context: {examples: [e]} }\n          ').join('') +
+        '- name: o_orderkey\n'),
+  }]);
+
+  test('an entry that would hold 100 instances of one aspect type fails, ' +
+           'and one with 99 passes',
+       () => {
+         expect(checkCatalogAspects(wide(100), V2_OPTS).error).toBe(
+             'entry \'sales/entities/orders\' would hold 100 overview ' +
+             'aspects, and Knowledge Catalog returns at most 100 in one read, ' +
+             'so kcmd could not read them all back; give examples to fewer ' +
+             'than 100 of the entity and its fields.');
+         expect(checkCatalogAspects(wide(99), V2_OPTS).error).toBeUndefined();
+       });
 
   test('a semantic-link aspect is checked too', async () => {
     stubClient();
