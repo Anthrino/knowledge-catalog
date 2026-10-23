@@ -4,6 +4,7 @@
 import * as cac from 'cac';
 
 import * as commands from './commands';
+import * as contextSetCommands from './context_set_commands';
 import * as entryCommands from './entry_commands';
 import * as mcp from './mcp';
 
@@ -22,6 +23,9 @@ cli.command('init', 'Initialize a new catalog snapshot')
     .option(
         '--semantic-model <id>',
         'Semantic model scope as <projectId>.<locationId>.<entryGroupId>')
+    .option(
+        '--description <text>',
+        'Initial description when creating a new semantic-model context set')
     .option('--pull', 'Optionally pull catalog entries during initialization')
     .action(async (options) => {
       let exitCode = 1;
@@ -119,6 +123,30 @@ cli.command(
           args = ['-'];
         }
         exitCode = await entryCommands.entry(action, args, options);
+      } catch (err: any) {
+        console.error('Error:', err.message || err);
+        exitCode = 1;
+      }
+
+      process.exit(exitCode);
+    });
+
+
+cli.command(
+       'context-set <action> [...args]',
+       'Read or set the workspace\'s context set description as JSON (action: get, set --description-file <file|->)')
+    .option(
+        '--description-file [file]',
+        'context-set set: file containing the new description, or - to read standard input')
+    .action(async (action, args, options) => {
+      let exitCode = 1;
+      try {
+        // cac's option parser treats a bare `-` after `--description-file` as
+        // a boolean flag rather than a string value, so check process.argv.
+        if (options.descriptionFile === true && typedDescriptionStdinDash()) {
+          options.descriptionFile = '-';
+        }
+        exitCode = await contextSetCommands.contextSet(action, args, options);
       } catch (err: any) {
         console.error('Error:', err.message || err);
         exitCode = 1;
@@ -271,4 +299,14 @@ function typedStdinDash(): boolean {
   const words = process.argv.slice(2);
   const at = words.indexOf('entry');
   return at >= 0 && words[at + 1] === 'save' && words.slice(at + 2).includes('-');
+}
+
+// Whether the caller typed `--description-file -` or `--description-file=-`.
+function typedDescriptionStdinDash(): boolean {
+  const words = process.argv.slice(2);
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] === '--description-file=-') return true;
+    if (words[i] === '--description-file' && words[i + 1] === '-') return true;
+  }
+  return false;
 }

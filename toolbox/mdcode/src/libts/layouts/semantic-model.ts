@@ -37,6 +37,16 @@ export interface LayoutScope {
 // Sidecar suffixes that are NOT model documents.
 const SIDECAR_SUFFIXES = ['.aspects.yaml', '.overview.yaml'];
 
+// The local overview sidecar for the entry group (context set) itself:
+// `catalog/EntryGroups/<entryGroup>/_context_set.overview.yaml`.
+export const CONTEXT_SET_OVERVIEW_FILE = '_context_set.overview.yaml';
+
+export interface ContextSetOverview {
+  description: string;
+  baseDescription?: string;
+  etag?: string;
+}
+
 // A binding-profile file sits beside its model as `<model>.profile.<name>.yaml`.
 // `<model>.profile.yaml`, with no name, is not a model either.
 const PROFILE_FILE = /^(.+)\.profile\.([^.]+)\.yaml$/;
@@ -503,6 +513,64 @@ export class SemanticModelLayout implements CatalogLayout {
       fs.rmSync(localPath);
     }
     this._index.delete(name);
+  }
+
+  // The path of the context set's local overview file:
+  // `<catalog>/EntryGroups/<entryGroup>/_context_set.overview.yaml`.
+  contextSetOverviewPath(): string {
+    return path.join(this._groupDir(), CONTEXT_SET_OVERVIEW_FILE);
+  }
+
+  // Reads the context set's local overview file, or returns undefined when it
+  // does not exist. Throws when the file does not parse as a YAML mapping.
+  readContextSetOverview(): ContextSetOverview|undefined {
+    const localPath = this.contextSetOverviewPath();
+    if (!fs.existsSync(localPath)) return undefined;
+    const text = fs.readFileSync(localPath, 'utf8');
+    let doc: any;
+    try {
+      doc = yaml.parse(text, YAML_OPTIONS);
+    } catch (err: any) {
+      throw new Error(
+          `Context set overview file '${CONTEXT_SET_OVERVIEW_FILE}' does not ` +
+          `parse: ${err?.message ?? err}`);
+    }
+    if (doc !== null && doc !== undefined &&
+        (typeof doc !== 'object' || Array.isArray(doc))) {
+      throw new Error(
+          `Context set overview file '${CONTEXT_SET_OVERVIEW_FILE}' must be ` +
+          `a YAML mapping.`);
+    }
+    return {
+      description: typeof doc?.description === 'string' ? doc.description : '',
+      ...(typeof doc?.baseDescription === 'string' ?
+              {baseDescription: doc.baseDescription} :
+              {}),
+      ...(typeof doc?.etag === 'string' ? {etag: doc.etag} : {}),
+    };
+  }
+
+  // Writes the context set's local overview file atomically, leaving the file
+  // untouched when its serialized content is unchanged. Returns whether the
+  // file was created, updated, or left unchanged.
+  async writeContextSetOverview(overview: ContextSetOverview):
+      Promise<'created'|'updated'|'unchanged'> {
+    const localPath = this.contextSetOverviewPath();
+    const record: Record<string, string> = {description: overview.description};
+    if (overview.baseDescription !== undefined) {
+      record.baseDescription = overview.baseDescription;
+    }
+    if (overview.etag !== undefined) {
+      record.etag = overview.etag;
+    }
+    const text = yaml.stringify(record);
+    const existed = fs.existsSync(localPath);
+    if (existed && fs.readFileSync(localPath, 'utf8') === text) {
+      return 'unchanged';
+    }
+    fs.mkdirSync(path.dirname(localPath), {recursive: true});
+    await writeFileAtomic(localPath, text);
+    return existed ? 'updated' : 'created';
   }
 
   // A copy of the entry, so a caller's edits never reach the view.
