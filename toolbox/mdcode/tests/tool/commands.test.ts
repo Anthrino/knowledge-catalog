@@ -1129,6 +1129,8 @@ function fakeCatalog(opts: {missingType?: string} = {}) {
       });
   spyOn(P, 'lookupEntryLinks')
       .mockImplementation(async () => ({status: 200, result: []}));
+  spyOn(P, 'createEntryLink')
+      .mockResolvedValue({status: 200, result: {}} as any);
   return {entries, create, list, entryType, aspectType};
 }
 
@@ -3312,6 +3314,65 @@ semantic_model:
           'so there is no store to run against. In a GOOGLE custom_extensions ' +
           "block on the model, declare a deployment in 'deployments' whose " +
           'target names a database.');
+    });
+  }
+});
+
+describe('what a push says about relationships', () => {
+  const TWO_ON_ONE_PAIR = `${MODEL_YAML}      - name: Order
+        primary_key: [id]
+        fields:
+          - { name: id }
+          - { name: buyer }
+          - { name: payer }
+    relationships:
+      - { name: bought_by, from: Order, to: Customer,
+          from_columns: [buyer], to_columns: [key] }
+      - { name: paid_by, from: Order, to: Customer,
+          from_columns: [payer], to_columns: [key] }
+`;
+  const PAID_BY = /\n      - \{ name: paid_by[^}]*\}\n/;
+  // Each case gives the exit code and a line the push prints.
+  const cases: [string, boolean, string, number, string][] = [
+    ['with KC_V2_ASPECTS on, counts entry links: one for the relationships ' +
+         'on one pair, and two reference links for each relationship',
+     true, TWO_ON_ONE_PAIR, 0,
+     'Wrote 5 new and 0 updated Knowledge Catalog entries; wrote 5 entry ' +
+         'links.'],
+    ['relationships in both directions on one pair stop the push', false,
+     TWO_ON_ONE_PAIR.replace(
+         PAID_BY,
+         '\n      - { name: first_order_of, from: Customer, to: Order, ' +
+             'from_columns: [key], to_columns: [buyer] }\n'),
+     1,
+     "Error: relationship 'first_order_of' in model 'commerce' (commerce) " +
+         "runs from 'Customer' to 'Order', and relationship 'bought_by' runs " +
+         'the other way; keep the relationships between two entities in one ' +
+         'direction.'],
+    ['a relationship from an entity to itself stops the push', false,
+     TWO_ON_ONE_PAIR.replace(
+         PAID_BY,
+         '\n      - { name: referred_by, from: Customer, to: Customer, ' +
+             'from_columns: [key], to_columns: [key] }\n'),
+     1,
+     "Error: relationship 'referred_by' in model 'commerce' (commerce) " +
+         "runs from 'Customer' to itself; a relationship joins two " +
+         'different entities.'],
+    ['with KC_V2_ASPECTS off, counts linked relationships', false,
+     TWO_ON_ONE_PAIR.replace(PAID_BY, '\n'), 0,
+     'Wrote 4 new and 0 updated Knowledge Catalog entries; linked 1 ' +
+         'relationship.'],
+  ];
+  for (const [title, v2, model, code, line] of cases) {
+    test(title, async () => {
+      writeWorkspace();
+      fs.writeFileSync(path.join(entryGroupDir(), 'commerce.yaml'), model);
+      if (v2) process.env.KC_V2_ASPECTS = '1';
+      fakeCatalog();
+
+      expect(await push({profile: false})).toBe(code);
+      expect(messages(code ? console.error : console.log).split('\n'))
+          .toContain(line);
     });
   }
 });
