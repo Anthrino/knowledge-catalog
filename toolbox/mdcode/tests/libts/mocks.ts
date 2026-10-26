@@ -98,6 +98,17 @@ export class CatalogClientMock extends gcp.CatalogClient {
     return { status: 200, result: { ...entry, aspects: Object.fromEntries(kept) } };
   }
 
+  async lookupEntryAspectTypes(project: string, location: string, name: string): Promise<gcp.ApiResult<string[]>> {
+    const entry = this.mockEntries.find(e => e.name == name);
+    if (!entry) {
+      return { status: 404, message: 'Not found' };
+    }
+    // As Dataplex's FULL view does: it lists every aspect key on the entry,
+    // with data or not, so every aspect type appears, each once.
+    const types = Object.keys(entry.aspects ?? {}).map(k => k.split('@')[0]);
+    return { status: 200, result: [...new Set(types)] };
+  }
+
   async modifyEntry(project: string, location: string, entry: gcp.Entry, updateMask?: string[], aspectKeys?: string[]): Promise<gcp.ApiResult<gcp.Entry>> {
     return this.applyUpdate(entry, updateMask, aspectKeys);
   }

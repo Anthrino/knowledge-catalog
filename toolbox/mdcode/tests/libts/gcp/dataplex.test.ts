@@ -246,6 +246,58 @@ describe('_fixEntry removed aspects', () => {
 });
 
 
+describe('CatalogClient.lookupEntryAspectTypes', () => {
+  test('reads the FULL view and names each aspect type once, with a project ID',
+       async () => {
+         const client = new CatalogClient(CTX);
+         const get = spyOn(client as any, '_get').mockImplementation(async () => ({
+           status: 200,
+           result: {
+             name: ENTRY,
+             aspects: {
+               // A FULL read gives no data to an aspect the type does not require.
+               'dataplex-types.global.overview': {},
+               '655216118709.global.guidelines@Schema.order_id': {},
+               'dataplex-types.global.guidelines@Schema.customer_id': {},
+             },
+           },
+         }));
+
+         const res = await client.lookupEntryAspectTypes('proj', 'us', ENTRY);
+
+         expect(get.mock.calls[0].slice(0, 2)).toEqual(
+             ['projects/proj/locations/us:lookupEntry', {entry: ENTRY, view: 'FULL'}]);
+         expect(res).toEqual({
+           status: 200,
+           result: ['dataplex-types.global.overview', 'dataplex-types.global.guidelines'],
+         });
+       });
+
+  test('looks up an unreadable project once per aspect type', async () => {
+    const client = new CatalogClient(CTX);
+    spyOn(client as any, '_get').mockImplementation(async () => ({
+      status: 200,
+      result: {
+        name: ENTRY,
+        aspects: {
+          '111.global.guidelines@Schema.order_id': {},
+          '111.global.guidelines@Schema.customer_id': {},
+        },
+      },
+    }));
+    // Resource Manager cannot read the project, and crm caches only the
+    // projects it can read.
+    const lookup = spyOn(ResourceManagerClient.prototype, 'getProject')
+                       .mockResolvedValue({status: 403} as any);
+
+    const res = await client.lookupEntryAspectTypes('proj', 'us', ENTRY);
+
+    expect(res.result).toEqual(['111.global.guidelines']);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    lookup.mockRestore();
+  });
+});
+
 // Dataplex keeps an aspect that aspectKeys names and the body leaves out
 // unless deleteMissingAspects is set, so a caller that means to remove one has
 // to send it.

@@ -54,14 +54,20 @@ export class CatalogSync {
         entries.push(entry);
       }
 
-      const aspectTypes = [...this._snapshot.aspectTypes.keys()];
+      // Pull fetches the aspect types it knows: those catalog.yaml lists and
+      // each entry's type requires. It warns about each other aspect type an
+      // entry carries, apart from the scope's system aspects.
+      const aspectTypes = this._snapshot.aspectTypes;
+      const requested = [...aspectTypes.keys()];
+      const system = new Set(this._snapshot.manifest.source.systemAspects);
+      const leftOut = new Map<string, number>();
       for (const entry of entries) {
         // TODO: Handle local modification conflicts.
         // TODO: Handle config changes or service deletions that require removing local entries.
 
         const nameParts = entry.name.split('/');
         const res = await this._catalog.lookupEntry(nameParts[1], nameParts[3], entry.name,
-                                                    aspectTypes);
+                                                    requested);
         // The server will respond with 403 permission denied for both resource not exist or 
         // insufficient permission. We cannot tell if a resource not exist or user does not 
         // have the access. Thus using 200 for an ensured result.
@@ -69,7 +75,24 @@ export class CatalogSync {
           continue;
         }
 
+        // lookupEntry sets every returned aspect's type.
+        const stored = new Set(Object.values(res.result.aspects ?? {})
+                                   .map(a => gcp._nameToTypeRef(a.aspectType!)));
         await this._snapshot._storeEntry(res.result);
+
+        const onEntry = await this._catalog.lookupEntryAspectTypes(
+            nameParts[1], nameParts[3], entry.name);
+        for (const type of onEntry.result ?? []) {
+          if (!stored.has(type) && !aspectTypes.has(type) && !system.has(type)) {
+            leftOut.set(type, (leftOut.get(type) ?? 0) + 1);
+          }
+        }
+      }
+      for (const [type, count] of leftOut) {
+        console.warn(
+            `Warning: pull left out aspect type '${type}' on ${count} ` +
+            `${count === 1 ? 'entry' : 'entries'}; list it under ` +
+            `snapshot.aspects in catalog.yaml to pull it.`);
       }
       return { success: true };
     }

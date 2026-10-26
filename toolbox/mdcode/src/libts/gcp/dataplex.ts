@@ -165,6 +165,29 @@ export class CatalogClient extends api.ApiClient {
     return res;
   }
 
+  // The type of every aspect on an entry, as project.location.type, each
+  // once. A FULL read lists every aspect but gives data only to those the
+  // entry's type requires, so this reads the keys alone, which lookupEntry
+  // would drop.
+  async lookupEntryAspectTypes(project: string, location: string,
+                               name: string): Promise<api.ApiResult<string[]>> {
+    const container = `${catalogContainer(project, location)}:lookupEntry`;
+    const res = await this._get<Entry>(container, { entry: name, view: 'FULL' });
+    if (res.status != 200 || !res.result) {
+      return { status: res.status, message: res.message };
+    }
+    // Each type is resolved once: crm caches only the projects it can read,
+    // so several field-path keys of one unreadable type would each look it up.
+    const typeRefs = new Set(Object.keys(res.result.aspects ?? {})
+                                 .map(key => key.split('@')[0]));
+    const types = new Set<string>();
+    for (const typeRef of typeRefs) {
+      const { aspectType } = await _aspectTypeOfKey(typeRef, this.context);
+      types.add(_nameToTypeRef(aspectType));
+    }
+    return { status: 200, result: [...types] };
+  }
+
   async modifyEntry(project: string, location: string, entry: Entry,
                     updateMask?: string[],
                     aspectKeys?: string[]): Promise<api.ApiResult<Entry>> {
@@ -445,12 +468,7 @@ export async function _fixEntry(entry: Entry, ctx: context.ApiContext,
     const fixedAspects: Record<string, Aspect> = {};
     for (const [aspectKey, aspectValue] of Object.entries(entry.aspects)) {
       if (!aspectValue || !Object.keys(aspectValue).length) continue;
-      const atIdx = aspectKey.indexOf('@');
-      const typeRef = atIdx === -1 ? aspectKey : aspectKey.slice(0, atIdx);
-      const keyPath = atIdx === -1 ? undefined : aspectKey.slice(atIdx + 1);
-
-      const aspectType =
-          await crm.fixProject(_typeRefToName(typeRef, 'aspect'), ctx);
+      const { aspectType, keyPath } = await _aspectTypeOfKey(aspectKey, ctx);
 
       const path = aspectValue.path || keyPath;
       const baseKey = _nameToTypeRef(aspectType);
@@ -464,6 +482,18 @@ export async function _fixEntry(entry: Entry, ctx: context.ApiContext,
     }
     entry.aspects = fixedAspects;
   }
+}
+
+// The aspect type an aspect key names, as a resource name with a project ID,
+// and the key's `@<path>` part, if any.
+async function _aspectTypeOfKey(key: string, ctx: context.ApiContext):
+    Promise<{ aspectType: string; keyPath?: string }> {
+  const atIdx = key.indexOf('@');
+  const typeRef = atIdx === -1 ? key : key.slice(0, atIdx);
+  return {
+    aspectType: await crm.fixProject(_typeRefToName(typeRef, 'aspect'), ctx),
+    keyPath: atIdx === -1 ? undefined : key.slice(atIdx + 1),
+  };
 }
 
 // Constructs canonical names for catalog container resources, identified by project, location and
