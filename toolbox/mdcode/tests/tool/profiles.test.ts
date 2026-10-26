@@ -18,7 +18,9 @@ import * as bigQueryDeploy from '../../src/libts/semantic/deploy_bigquery';
 import {createSemanticRuntimes} from '../../src/libts/semantic/runtime/runtime';
 import * as sqlParser from '../../src/libts/semantic/sql_parser';
 import {profiles, push} from '../../src/tool/commands';
-import {stubCloudSqlEntry} from '../libts/mocks';
+import {passGraphChecks, stubCloudSqlEntry} from '../libts/mocks';
+
+import {modelFile} from './two_phase/harness';
 
 const CTX = new ApiContext('test-project', 'us', 'test-token');
 
@@ -122,6 +124,7 @@ beforeEach(() => {
   spyOn(globalThis, 'fetch').mockImplementation((() => {
     throw new Error('a test made a network call');
   }) as any);
+  passGraphChecks();
   spyOn(ApiContext, 'default').mockReturnValue(CTX);
   spyOn(console, 'log').mockImplementation((...a: any[]) => {
     logs.push(a.join(' '));
@@ -216,20 +219,14 @@ relationships:
         path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg',
                   'commerce.profile.staging.yaml'),
         'name: staging\n');
-    // A profile that cannot be applied fails the command. The model file's
-    // error is reported under each profile, as push words it for that
-    // profile, and under the inline bindings, which push loads alone too.
+    // A plain push loads the model file alone first, so the report gives
+    // its error once, above the models.
     expect(await profiles()).toBe(1);
     const out = logs.join('\n');
     expect(out).toContain(
         "relationship 'placed_by': from_columns and to_columns must be given " +
         'together');
-    expect(out.split("Model document 'commerce'").length - 1).toBe(3);
-    for (const name of ['prod', 'staging']) {
-      expect(out).toContain(
-          `(under profile '${name}', the model file must load on its own ` +
-          'before the profile applies)');
-    }
+    expect(out.split("Model document 'commerce'").length - 1).toBe(1);
   });
 
   // A legacy wrapper that fails to load fails the command too.
@@ -684,11 +681,10 @@ describe('kcmd profiles reports what push rejects', () => {
       "inline 'default' binding.";
 
   // Purchases join customers on the customer's key, c_id. `targets` is how
-  // many graph deployments the model declares, of which a graph push takes
-  // exactly one. `joined: false` leaves the join without columns, which push
-  // rejects for a model with a graph target.
+  // many graph deployments the model declares. `joined: false` leaves the join
+  // without columns, which push rejects for a model with a graph target.
   function commerce({targets = 0, joined = true} = {}): string {
-    const deployments = ['prod', 'qa'].slice(0, targets).map(
+    const deployments = ['prod'].slice(0, targets).map(
         d => `      - name: ${d}\n        target: ${GRAPH}_${d}\n`);
     return `version: "0.2.0.dev0/google"
 semantic_model:
@@ -854,6 +850,11 @@ ${target ? `    deployment_target: ${GRAPH}\n` : ''}\
     expect(errs).toContain(lines[at]);
     return out;
   }
+  // The errors under every `push rejects:` heading of the report, in order.
+  const allRejects = () => logs.flatMap(
+      (l, i) => l.trim() === 'push rejects:' ?
+          rejects(logs.slice(i), l.replace('push rejects:', '')) :
+          []);
 
   // Each push in `pushes` fails with exactly its errors, or passes with none,
   // and `kcmd profiles` shows them under that binding. A key names the profile
@@ -871,6 +872,23 @@ ${target ? `    deployment_target: ${GRAPH}\n` : ''}\
       expect({label, profile, errors: rejects(lines)})
           .toEqual({label, profile, errors});
     }
+  }
+
+  // A plain push fails with exactly the errors in `sections`, or passes with
+  // none, and `kcmd profiles` shows each under its key: a profile, 'default'
+  // for the model file's own bindings, or 'model' above the profiles.
+  async function expectReport(sections: Record<string, string[]>, label = '') {
+    const errors = Object.values(sections).flat();
+    const {code, errors: pushed} = await pushResult();
+    expect({label, code, errors: [...pushed].sort()}).toEqual(
+        {label, code: errors.length ? 1 : 0, errors: [...errors].sort()});
+    expect(await profiles()).toBe(errors.length ? 1 : 0);
+    for (const [key, want] of Object.entries(sections)) {
+      const got = key === 'model' ? rejects(logs, '  ') :
+          rejects(key === 'default' ? section(INLINE) : profileSection(key));
+      expect({label, key, errors: got}).toEqual({label, key, errors: want});
+    }
+    expect(allRejects()).toHaveLength(errors.length);
   }
 
   // The model file's error for field `name`, written 'entity.field', with no
@@ -1064,21 +1082,6 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       },
     ],
     [
-      'a profile file sits beside a model file with a graph deployment',
-      {
-        'commerce.yaml': commerce({targets: 1}),
-        'commerce.profile.prod.yaml': profileFile('prod'),
-      },
-    ],
-    [
-      'the model file\'s deployment names the profile',
-      {
-        'commerce.yaml': commerce({targets: 1})
-                             .replace(/(target: \S+)\n/, '$1\n        profile: prod\n'),
-        'commerce.profile.prod.yaml': profileFile('prod'),
-      },
-    ],
-    [
       'the model file does not load on its own',
       {
         'commerce.yaml': commerce().replace('        to_columns: [c_id]\n', ''),
@@ -1095,34 +1098,36 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       },
     ],
   ];
+  // A plain push of a model with a sibling profile file runs in two phases,
+  // and the report gives its errors instead.
   for (const [label, files] of rejected) {
-    test(`prints only push's errors under the profile when ${label}`, async () => {
+    test(`prints only push's errors when ${label}`, async () => {
       writeScope(files);
-      const pushed = await pushResult('prod');
+      const twoPhase = Object.keys(files).some(f => f.includes('.profile.'));
+      const pushed = await pushResult(twoPhase ? {} : 'prod');
       expect(pushed.code).toBe(1);
       expect(pushed.errors).not.toEqual([]);
       expect(await profiles()).toBe(1);
-      expect(rejects(profileSection('prod'))).toEqual(pushed.errors);
+      expect(allRejects()).toEqual(pushed.errors);
     });
   }
 
-  // Push refuses a deployment that names a profile. The report has no check
-  // of its own for it: it shows push's refusal under each binding push
-  // refuses.
-  test('shows push\'s refusal of a deployment that names a profile under each binding', async () => {
+  // Push applies the profile a deployment names, but it only stores a legacy
+  // profile, so a deployment cannot use one. The report gives push's error
+  // under that profile, and none under the model file's own bindings.
+  test('push refuses a deployment that names a legacy profile, and the report gives the error under that profile', async () => {
     writeScope({
       'commerce.yaml': commerce({targets: 1})
                            .replace(/(target: \S+)\n/, '$1\n        profile: prod\n'),
       'commerce.profiles/prod.yaml': legacyProfile(false),
     });
-    const refusal = "[commerce] model 'commerce': deployment 'prod' names " +
-        "profile 'prod'; remove 'profile' from the deployment entry so it " +
-        "uses the model file's own bindings.";
-    expect(await pushResult('prod')).toEqual({code: 1, errors: [refusal]});
-    expect(await pushResult()).toEqual({code: 1, errors: [refusal]});
+    const legacy = "[commerce] deployment 'prod' names profile 'prod', which " +
+        "is in the legacy 'semantic_model:' form; a deployment can use only " +
+        'a profile file.';
+    expect(await pushResult()).toEqual({code: 1, errors: [legacy]});
     expect(await profiles()).toBe(1);
-    expect(rejects(profileSection('prod'))).toEqual([refusal]);
-    expect(rejects(section(INLINE))).toEqual([refusal]);
+    expect(rejects(profileSection('prod'))).toEqual([legacy]);
+    expect(section(INLINE)).toEqual([]);
   });
 
   test('prints push\'s errors at the profile\'s indent, under a heading', async () => {
@@ -1130,11 +1135,8 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       'commerce.yaml': commerce(),
       'commerce.profile.prod.yaml': profileFile('prod', 'LOWER(c_id)'),
     });
-    const pushed = await pushResult('prod');
+    const pushed = await pushResult();
     expect(pushed.errors).toHaveLength(1);
-    // A push of the inline bindings checks the profile file too.
-    const inline = await pushResult();
-    expect(inline.errors).toHaveLength(1);
     expect(await profiles()).toBe(1);
     expect(logs).toEqual([
       "Model 'commerce' (commerce_eg):",
@@ -1146,14 +1148,8 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       '    cannot answer: nothing withheld.',
       '    push rejects:',
       `      ${pushed.errors[0]}`,
-      INLINE,
-      '    push rejects:',
-      `      ${inline.errors[0]}`,
     ]);
-    expect(errs).toEqual([
-      '    push rejects:', `      ${pushed.errors[0]}`, '    push rejects:',
-      `      ${inline.errors[0]}`
-    ]);
+    expect(errs).toEqual(['    push rejects:', `      ${pushed.errors[0]}`]);
   });
 
   test('checks a profile that names a graph as a graph push, and one that does not as a catalog-only push', async () => {
@@ -1185,40 +1181,19 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       'commerce.profile.b.yaml':
           'name: b\nrelationships:\n  - name: placed_by\n    to_columns: [c_email]\n',
     });
-    const a = (await pushResult('a')).errors;
-    const b = (await pushResult('b')).errors;
-    expect(a).not.toEqual([]);
-    expect(b).not.toEqual([]);
+    const {errors} = await pushResult();
+    const own = (p: string) =>
+        errors.filter(e => e.startsWith(`[commerce.profile.${p}.yaml]`));
+    expect(own('a')).not.toEqual([]);
+    expect(own('b')).not.toEqual([]);
     expect(await profiles()).toBe(1);
-    expect(rejects(profileSection('a'))).toEqual(a);
-    expect(rejects(profileSection('b'))).toEqual(b);
+    expect(rejects(profileSection('a'))).toEqual(own('a'));
+    expect(rejects(profileSection('b'))).toEqual(own('b'));
   });
 
-  // Two deployments fail a graph push only, so this also shows the inline
-  // bindings get the checks of the push that deploys them.
-  test('prints push\'s errors for the inline bindings', async () => {
-    writeScope({'commerce.yaml': commerce({targets: 2})});
-    const pushed = await pushResult();
-    expect(pushed.errors).toEqual(
-        [expect.stringContaining('declares 2 deployments')]);
-    expect(await profiles()).toBe(1);
-    expect(logs).toEqual([
-      "Model 'commerce' (commerce_eg):",
-      NO_PROFILES,
-      '    push rejects:',
-      `      ${pushed.errors[0]}`,
-    ]);
-    logs.length = 0;
-    expect(await profiles({profile: 'default'})).toBe(1);
-    expect(logs).toEqual([
-      "Model 'commerce' (commerce_eg):",
-      INLINE,
-      '    push rejects:',
-      `      ${pushed.errors[0]}`,
-    ]);
-  });
-
-  // Push generates each graph's DDL offline, and a generator can fail.
+  // Push generates each graph's DDL offline, and a generator can fail. Its
+  // error names the deployment.
+  const DEPLOYMENT_LABEL = "[commerce] deployment 'prod': ";
   const ungenerated: Array<[string, string]> = [
     ['BigQuery', uniqueKeysOnly(commerce({targets: 1}))],
     [
@@ -1232,8 +1207,8 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
     test(`prints the error generating a ${system} graph gives`, async () => {
       writeScope({'commerce.yaml': model});
       const pushed = await pushResult();
-      expect(pushed.errors).toEqual(
-          [expect.stringContaining('cannot generate a property graph')]);
+      expect(pushed.errors).toEqual([expect.stringContaining(
+          `${DEPLOYMENT_LABEL}cannot generate a property graph`)]);
       expect(await profiles()).toBe(1);
       expect(rejects(section(NO_PROFILES))).toEqual(pushed.errors);
     });
@@ -1251,13 +1226,17 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       deployed: 0,
     });
     const pushed = await pushResult();
-    expect(pushed).toEqual({code: 1, errors: ['simulated generator failure']});
+    expect(pushed).toEqual({
+      code: 1,
+      errors: [`${DEPLOYMENT_LABEL}simulated generator failure`],
+    });
     expect(await profiles()).toBe(1);
     expect(rejects(section(NO_PROFILES))).toEqual(pushed.errors);
   });
 
-  // `kcmd push --profile default`, and a bare push when no `default_profile`
-  // is set, deploy the inline bindings beside the profile files.
+  // A plain push checks the model file's own bindings beside a profile file,
+  // whatever `default_profile` names, and the report gives the error above
+  // the profiles.
   for (const defaultProfile of [undefined, 'prod']) {
     test(`checks the inline bindings beside a profile file${
              defaultProfile ? ' when default_profile is set' : ''}`,
@@ -1268,26 +1247,21 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
                  'commerce.profile.prod.yaml': profileFile('prod'),
                },
                defaultProfile);
-           // A push of prod fails on the model file's join too. The profile
-           // comparison reports it, so its message differs from push's own.
-           const prod = await pushResult('prod');
-           expect(prod).toEqual(
-               {code: 1, errors: [compared('the model file', 'c_email')]});
-           const pushed = await pushResult('default');
+           const pushed = await pushResult();
            expect(pushed).toEqual(
                {code: 1, errors: [own('commerce', 'c_email')]});
            expect(await pushResult({deployment: false})).toEqual(pushed);
            expect(await profiles()).toBe(1);
-           const marker = defaultProfile === 'prod' ? ' (default)' : '';
-           expect(rejects(section(`  profile 'prod'${marker}`)))
-               .toEqual(prod.errors);
-           expect(rejects(section(INLINE))).toEqual(pushed.errors);
+           expect(rejects(logs, '  ')).toEqual(pushed.errors);
+           expect(allRejects()).toEqual(pushed.errors);
+           logs.length = 0;
+           expect(await profiles({profile: 'default'})).toBe(1);
+           expect(rejects(logs, '  ')).toEqual(pushed.errors);
          });
   }
 
-  // A push that names no profile deploys `default_profile`, so it fails when
-  // the model does not declare that profile. A push that names a profile does
-  // not read `default_profile`.
+  // A plain push refuses a `default_profile` the model does not declare. The
+  // report prints the error above the profiles, under `--profile` too.
   test('prints push\'s error when default_profile names a profile the model does not declare', async () => {
     writeScope(
         {
@@ -1303,15 +1277,14 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
             'profiles: prod.',
       ],
     });
-    expect(await pushResult('prod')).toEqual({code: 0, errors: []});
     expect(await profiles()).toBe(1);
     expect(logs[1]).toBe('  push rejects:');
     expect(rejects(logs, '  ')).toEqual(pushed.errors);
     expect(rejects(profileSection('prod'))).toEqual([]);
     logs.length = 0;
     errs.length = 0;
-    expect(await profiles({profile: 'prod'})).toBe(0);
-    expect(errs).toEqual([]);
+    expect(await profiles({profile: 'prod'})).toBe(1);
+    expect(rejects(logs, '  ')).toEqual(pushed.errors);
   });
 
   // `default_profile: default` names the inline bindings, which every model
@@ -1334,6 +1307,12 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       '  - name: commerce\n',
       `  - name: commerce\n    custom_extensions:\n      - {vendor_name: DBT, ` +
           `data: ${'x'.repeat(130 * 1024)}}\n`);
+  // Customer's c_id field and 400 more, each reading its own column. A
+  // profile file restates them all, so each profile adds 401 expressions to
+  // customer's aspect.
+  const WIDE = `fields: [{ name: c_id, expression: c_id }, ${
+      Array.from({length: 400}, (_, i) => `{ name: f${i}, expression: col_${i} }`)
+          .join(', ')}]`;
   // Push gives a scope with two models its one-model error, once, and checks
   // neither the copies nor the aspects.
   for (const [label, model, v2] of [
@@ -1409,15 +1388,24 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
 
   // With KC_V2_ASPECTS on, push reads the overview sidecars and checks every
   // aspect the catalog leg writes, before any graph deploys. A malformed
-  // sidecar is reported once, for the scope.
+  // sidecar is reported once, for the scope. For a push in two phases, an
+  // aspect too large belongs to the model.
   for (const [label, files, error, profile, indent = '    '] of [
          ['an aspect over the size limit in a graph push',
           {'commerce.yaml': bigBlock(commerce({targets: 1}))},
-          'too large to store in Knowledge Catalog'],
-         ['an aspect over the size limit for a named profile', {
+          'too large to store in Knowledge Catalog', undefined, '  '],
+         ['an aspect over the size limit beside a profile file', {
            'commerce.yaml': bigBlock(commerce()),
            'commerce.profile.prod.yaml': profileFile('prod'),
-         }, 'too large to store in Knowledge Catalog', 'prod'],
+         }, 'too large to store in Knowledge Catalog', undefined, '  '],
+         ['an aspect only six profile files together make too large', {
+           'commerce.yaml': commerce().replace(
+               'fields:\n          - { name: c_id, expression: c_id }', WIDE),
+           ...Object.fromEntries(['a', 'b', 'c', 'd', 'e', 'f'].map(p => [
+             `commerce.profile.${p}.yaml`,
+             profileFile(p).replace(/fields: \[\{ name: c_id.*/, WIDE),
+           ])),
+         }, 'too large to store in Knowledge Catalog', undefined, '  '],
          ['a malformed overview sidecar', {
            'commerce.yaml': commerce(),
            'commerce.overview.md':
@@ -1467,9 +1455,19 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
          expect(await profiles()).toBe(0);
          expect(warned.splice(0)).toEqual(
              [warning, sidecar].map(w => `  profile 'default': warning: ${w}`));
-         delete process.env.KC_V2_ASPECTS;
-         writeScope({'commerce.yaml': model});
+         // A model that lists deployments: the report warns once, as push does.
+         const deployed = commerce({targets: 1}).replace(
+             '  - name: commerce\n',
+             '  - name: commerce\n    ai_context: {custom: {cap: .inf}}\n');
+         writeScope({'commerce.yaml': deployed});
          expect(await profiles()).toBe(0);
+         expect(warned.splice(0))
+             .toEqual([warning, sidecar].map(w => `Warning: ${w}`));
+         delete process.env.KC_V2_ASPECTS;
+         for (const m of [model, deployed]) {
+           writeScope({'commerce.yaml': m});
+           expect(await profiles()).toBe(0);
+         }
          expect(warned).toEqual([]);
        });
 
@@ -1662,6 +1660,7 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
           "'from_columns' and 'to_columns' itself",
     ];
 
+    // The report gives a profile's errors under that profile.
     test('when the push deploys another binding', async () => {
       writeScope({
         'commerce.yaml': commerce({targets: 1}),
@@ -1670,13 +1669,14 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       const errors = incomplete('commerce.profile.staging.yaml');
       expect(await pushResult()).toEqual({code: 1, errors});
       expect(await profiles()).toBe(1);
-      expect(rejects(section(INLINE))).toEqual(errors);
+      expect(rejects(profileSection('staging'))).toEqual(errors);
+      expect(section(INLINE)).toEqual([]);
     });
 
     // The completeness check also requires each field a profile binds to hold
     // SQL on each entity that inherits it, as applying the profile does. A
-    // push of another binding reports such a field once, in the words a push
-    // of the profile gives.
+    // plain push reports such a field once, in the words a push of the
+    // profile gives, and the report gives it under the profile.
     test('when a profile file leaves an inherited field with no SQL', async () => {
       writeScope({
         'commerce.yaml': PARTIES,
@@ -1688,7 +1688,7 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       expect(await pushResult()).toEqual({code: 1, errors});
       expect(await profiles()).toBe(1);
       expect(rejects(profileSection('prod'))).toEqual(errors);
-      expect(rejects(section(INLINE))).toEqual(errors);
+      expect(section(INLINE)).toEqual([]);
     });
 
     // The model file's customer restates each field it inherits whose
@@ -1703,7 +1703,8 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
           "field 'id' is inherited from 'party', whose expression reads " +
           "column 'id' of that entity's table; restate it with an expression " +
           "for this entity's table.";
-      await expectPushes({default: [inherited], prod: [inherited]});
+      expect(await pushResult('prod')).toEqual({code: 1, errors: [inherited]});
+      await expectReport({default: [inherited], prod: []});
       expect(await pushResult({deployment: false})).toEqual({code: 1, errors: [inherited]});
       writeScope({'commerce.yaml': unrestated.replace('[party]', '[party, ghost]')});
       expect(await pushResult()).toEqual({code: 1, errors: [expect.stringContaining(
@@ -1750,7 +1751,7 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
         expect({columns, ...await pushResult()}).toEqual(expected);
         expect(await profiles()).toBe(1);
         expect(rejects(profileSection('staging'))).toEqual([error]);
-        expect(rejects(section(INLINE))).toEqual([error]);
+        expect(section(INLINE)).toEqual([]);
         logs.length = 0;
         errs.length = 0;
         expect(await createSemanticRuntimes({profile: 'staging', ctx: CTX}))
@@ -2012,7 +2013,7 @@ semantic_model:
     // reports, and what push's key check may misread. It compares no join
     // until the hierarchy resolves.
     test('and reports each key and join problem at most once', async () => {
-      const model = (targets = 0) => joinOnEmail(commerce({targets}));
+      const model = () => joinOnEmail(commerce());
       const unknown = (binding: string) =>
           `model 'commerce' (${binding}): entity 'customer' extends unknown ` +
           "entity 'nope'; it is not defined in the model. Checks that need " +
@@ -2026,14 +2027,12 @@ semantic_model:
           'commerce.yaml': model(),
           [file]: profileFile('staging').replace(/relationships:[\s\S]*/, ''),
         }, {
-          staging: [
-            incomplete(file)[1],
-            own("commerce, profile 'staging'", 'c_email'),
-          ],
+          model: [own('commerce', 'c_email')],
+          staging: [incomplete(file)[1]],
         }],
         ['a legacy wrapper that excludes the key field', {
-          'commerce.yaml': model(1),
-          'commerce.profiles/legacy.yaml': legacyProfile(false).replace(
+          'commerce.yaml': model(),
+          'commerce.profiles/legacy.yaml': legacyProfile(true).replace(
               /source: .*/, 'fields_exclude: [c_id]'),
           'commerce.profiles/staging.yaml': profileFile('staging'),
         }, {legacy: [own("commerce, profile 'legacy'", 'c_email')]}],
@@ -2041,10 +2040,7 @@ semantic_model:
           'commerce.yaml': commerce(),
           'commerce.profile.a.yaml': profileFile('a').replace(
               'to_columns: [c_id]', 'to_columns: ["`c_name`"]'),
-        }, {
-          a: [own("commerce, profile 'a'", '`c_name`')],
-          default: [compared("profile 'a'", '`c_name`')],
-        }],
+        }, {model: [compared("profile 'a'", '`c_name`')], a: []}],
         ['an AlloyDB key field bound to "c_id", which push may misread', {
           'commerce.yaml': commerce()
               .replace('primary_key: [c_id]', 'primary_key: [c_key]')
@@ -2053,21 +2049,21 @@ semantic_model:
               '{ name: c_id, expression: c_id }', '{ name: c_key, ' +
                   'expression: {dialects: [{dialect: ALLOYDB, expression: ' +
                   '\'"c_id"\'}]} }'),
-        }, {x: [own("commerce, profile 'x'", 'c_id')], default: []}],
+        }, {x: []}],
         ['customer extends an unknown entity, so no join is compared', {
           'commerce.yaml': commerce().replace(
               'name: customer\n', 'name: customer\n        extends: [nope]\n'),
           'commerce.profile.a.yaml': profileFile('a'),
           'commerce.profile.b.yaml': joinOnEmail(profileFile('b')),
-        }, {
-          default: [unknown('commerce')],
-          a: [unknown("commerce, profile 'a'")],
-        }],
+        }, {model: [unknown('commerce')], a: [], b: []}],
       ];
       for (const [label, files, pushes] of cases) {
         fs.rmSync(path.join(dir, 'catalog'), {recursive: true, force: true});
         writeScope(files);
-        await expectPushes(pushes, label);
+        // A sibling profile file makes a plain push run in two phases.
+        await (Object.keys(files).some(f => f.includes('.profile.')) ?
+                   expectReport(pushes, label) :
+                   expectPushes(pushes, label));
       }
     });
 
@@ -2253,12 +2249,14 @@ semantic_model:
     // graph deploys, so its profile errors leave every graph as it was.
     test('before any graph deploys, under --no-kc with two models', async () => {
       writeScope({
-        'commerce.yaml': commerce({targets: 1}),
+        'commerce.yaml':
+            modelFile({google: {deploymentTargets: [`${GRAPH}_prod`]}}),
         'inventory.yaml': commerce().replace('name: commerce', 'name: inventory'),
         'inventory.profile.staging.yaml': STAGING,
       });
       const deploy = spyOn(bigQueryDeploy, 'deployBigQuery');
-      expect(await push({validateOnly: true, kc: false})).toBe(1);
+      expect(await push({validateOnly: true, kc: false, profile: 'default'}))
+          .toBe(1);
       expect(deploy).not.toHaveBeenCalled();
       expect(logs).toEqual(expect.arrayContaining(
           incomplete('inventory.profile.staging.yaml').map(e => `Error: ${e}`)));
@@ -2352,27 +2350,6 @@ ${shopExtends}        source: ${BQ('dev', 'shop')}
           /^Model document 'commerce': [^]*\(under profile 'staging', the model file must load on its own before the profile applies\)$/)]);
     });
 
-    // A deployment that names a profile stops the push before the profile
-    // checks, so an incomplete profile file is reported on the next push.
-    test('after a deployment that names a profile is fixed', async () => {
-      writeScope({
-        'commerce.yaml': commerce({targets: 1}).replace(
-            /(target: \S+_prod\n)/, '$1        profile: staging\n'),
-        'commerce.profile.staging.yaml': STAGING,
-      });
-      expect(await pushResult()).toEqual({
-        code: 1,
-        errors: [
-          "[commerce] model 'commerce': deployment 'prod' names profile " +
-              "'staging'; remove 'profile' from the deployment entry so it " +
-              "uses the model file's own bindings.",
-        ],
-      });
-      writeScope({'commerce.yaml': commerce({targets: 1})});
-      expect(await pushResult()).toEqual(
-          {code: 1, errors: incomplete('commerce.profile.staging.yaml')});
-    });
-
     // --all-profiles --no-kc deploys each profile's graph and publishes
     // nothing, so a model that deploys no graph and does not declare the
     // default_profile is neither deployed nor checked.
@@ -2417,8 +2394,8 @@ ${shopExtends}        source: ${BQ('dev', 'shop')}
         ],
       });
       expect(await profiles()).toBe(1);
-      expect(rejects(section(INLINE))).toEqual(bare.errors);
-      expect(rejects(profileSection('prod'))).toEqual(prod.errors);
+      expect(rejects(profileSection('prod'))).toEqual(bare.errors);
+      expect(section(INLINE)).toEqual([]);
     });
 
     // #516's check that each inherited field holds SQL needs the whole
@@ -2454,7 +2431,7 @@ ${shopExtends}        source: ${BQ('dev', 'shop')}
       expect(await pushResult()).toEqual({code: 1, errors});
       expect(await profiles()).toBe(1);
       expect(rejects(profileSection('prod'))).toEqual(errors);
-      expect(rejects(section(INLINE))).toEqual(errors);
+      expect(section(INLINE)).toEqual([]);
     });
 
     // Push's own check of the SQL it reads stands down when the model file's
@@ -2601,7 +2578,7 @@ ${shopExtends}        source: ${BQ('dev', 'shop')}
       expect(await pushResult('prod')).toEqual({code: 1, errors});
       expect(await profiles()).toBe(1);
       expect(rejects(profileSection('prod'))).toEqual(errors);
-      expect(rejects(section(INLINE))).toEqual(errors);
+      expect(section(INLINE)).toEqual([]);
     });
 
     // The checks of a profile the push does not apply read a source written
@@ -2860,12 +2837,13 @@ semantic_model:
         ];
         for (const [file, block, expected] of cases) {
           writeScope({
-            'commerce.yaml': commerce({targets: 1}),
+            'commerce.yaml': commerce(),
             'commerce.profile.staging.yaml': file,
             'shop.yaml': vanilla([block], 'shop'),
           });
           logs.length = 0;
-          expect(await push({validateOnly: true, kc: false})).toBe(1);
+          expect(await push({validateOnly: true, kc: false, profile: 'default'}))
+              .toBe(1);
           expect(logs.filter(l => l.startsWith('Error: ')))
               .toEqual(expected.map(e => `Error: ${e}`));
         }
@@ -2873,13 +2851,11 @@ semantic_model:
     });
   });
 
-  // Push judges each deployment on the model file as loaded, and `kcmd
-  // profiles` reports what push rejects. Each deployment uses the model
-  // file's own bindings, since push refuses one that names a profile.
+  // Push judges each deployment that names no profile on the model file as
+  // loaded, and `kcmd profiles` reports what push rejects.
   describe('push holds each deployment to the rules of its engine', () => {
     const OWN = "model 'commerce' (commerce) deployment 'prod' uses the " +
         "model file's own bindings, ";
-    const noProfile = {profile: false};
     const noDeployment = {deployment: false};
     // `model`, a commerce() text, with `fields` added to purchase after p_id.
     const withFields = (model: string, ...fields: string[]) => model.replace(
@@ -2890,45 +2866,28 @@ semantic_model:
         `${withFields(commerce({targets: 1}), ...fields)}    metrics:\n` +
         `      - ${metric}\n`;
 
-    // Each unbound entity or relationship is reported once, by push's own
-    // checks where they see it and by this check otherwise. No warning prints.
-    test('rejects a deployment that uses incomplete inline bindings, on every push but a legacy wrapper push', async () => {
+    // Each unbound entity or relationship is reported once. No warning prints.
+    test('rejects a deployment that uses incomplete inline bindings, on every push', async () => {
       const unbound = (left = "entity 'customer' without a source") =>
           `${OWN}which leave ${left}; a deployment needs every entity and ` +
           'relationship bound.';
       writeScope({'commerce.yaml': customerUnbound(commerce({targets: 1}))});
-      expect(await pushResult()).toEqual({
-        code: 1,
-        errors: [expect.stringContaining(
-            "dataset 'customer': a non-abstract dataset requires a source")],
-      });
-      for (const opts of [noProfile, noDeployment]) {
-        expect(await pushResult(opts)).toEqual({code: 1, errors: [unbound()]});
-      }
-      // A legacy wrapper push deploys the wrapper's bindings.
-      writeScope({'commerce.profiles/legacy.yaml': legacyProfile(false)});
-      expect(await pushResult('legacy')).toEqual({code: 0, errors: []});
-      fs.rmSync(path.join(dir, 'catalog'), {recursive: true, force: true});
+      expect(await pushResult()).toEqual({code: 1, errors: [unbound()]});
 
       writeScope({'commerce.yaml': commerce({targets: 1, joined: false})});
       const unjoined = await pushResult();
       expect(unjoined).toEqual({
         code: 1,
-        errors: [expect.stringContaining(
-            "relationship 'placed_by' in model 'commerce' (commerce) " +
-            'targets a graph but has no join columns')],
+        errors: [unbound("relationship 'placed_by' without join columns")],
       });
-      expect(await pushResult(noProfile)).toEqual(unjoined);
-      expect((await pushResult(noDeployment)).errors)
-          .toEqual([unbound("relationship 'placed_by' without join columns")]);
       expect(await profiles()).toBe(1);
       expect(rejects(section(NO_PROFILES))).toEqual(unjoined.errors);
 
       writeScope({
         'commerce.yaml': customerUnbound(commerce({targets: 1, joined: false})),
         'commerce.profile.prod.yaml': profileFile('prod'),
-      }, 'prod');
-      expect(await pushResult(noProfile)).toEqual({
+      });
+      expect(await pushResult(noDeployment)).toEqual({
         code: 1,
         errors: [unbound("entity 'customer' without a source and " +
                          "relationship 'placed_by' without join columns")],
@@ -2984,9 +2943,9 @@ semantic_model:
               .replace(`${GRAPH}_prod`, db)
               .replaceAll(BQ('dev', ''), `${db}/schemas/public/tables/`);
       writeScope({'commerce.yaml': alloyDb('note', 'p_id')});
-      expect(await pushResult(noProfile)).toEqual({code: 0, errors: []});
+      expect(await pushResult(noDeployment)).toEqual({code: 0, errors: []});
       writeScope({'commerce.yaml': alloyDb('p_id', 'note')});
-      expect(await pushResult(noProfile))
+      expect(await pushResult(noDeployment))
           .toEqual({code: 1, errors: [reads('m', 'purchase.note')]});
     });
 
@@ -3002,7 +2961,7 @@ semantic_model:
                      '[{ dialect: BIGQUERY, expression: p_id }] } }'),
       });
       const spanner = `${modelNoText('purchase.p_id', 'SPANNER')}.`;
-      for (const opts of [{}, noProfile, noDeployment]) {
+      for (const opts of [{}, noDeployment]) {
         expect({opts, ...await pushResult(opts)})
             .toEqual({opts, code: 1, errors: [spanner]});
       }
@@ -3021,15 +2980,11 @@ semantic_model:
                 withFields(commerce({targets}), amount(dialect, text)),
           });
           const label = {targets, dialect, text};
-          for (const opts of [{}, noDeployment]) {
-            expect({...label, ...await pushResult(opts)})
-                .toEqual({...label, code: 1, errors});
-          }
-          for (const opts of [noProfile, noDeployment]) {
-            expect({...label, ...await pushResult({...opts, transpile: true})})
-                .toEqual({...label, code: transpiledErrors.length ? 1 : 0,
-                          errors: transpiledErrors});
-          }
+          expect({...label, ...await pushResult()})
+              .toEqual({...label, code: 1, errors});
+          expect({...label, ...await pushResult({...noDeployment, transpile: true})})
+              .toEqual({...label, code: transpiledErrors.length ? 1 : 0,
+                        errors: transpiledErrors});
         }
       }
     });
@@ -3043,10 +2998,11 @@ semantic_model:
         'commerce.yaml':
             withMetric('{ name: half, expression: "SUM(purchase.p_id) / 2" }'),
       });
-      await expectPushes({
-        default: [`${MEASURE}'half' cannot be a measure: it is not SUM, AVG, ` +
-                  'COUNT, MIN or MAX over one operand.'],
-      });
+      const half = `${MEASURE}'half' cannot be a measure: it is not SUM, ` +
+          'AVG, COUNT, MIN or MAX over one operand.';
+      expect(await pushResult()).toEqual({code: 1, errors: [half]});
+      expect(await profiles()).toBe(1);
+      expect(rejects(section(NO_PROFILES))).toEqual([half]);
       const block = (data: object) =>
           `custom_extensions: [{vendor_name: GOOGLE, data: '${
               JSON.stringify(data)}'}]`;
@@ -3119,8 +3075,8 @@ semantic_model:
         'commerce.yaml': customerUnbound(commerce({targets: 1}))
             .replace(/(target: \S+)\n/, '$1\n        profile: prod\n'),
       });
-      expect((await pushResult(noProfile)).code).toBe(1);
-      expect(await profiles()).toBe(1);
+      expect(await pushResult()).toEqual({code: 0, errors: []});
+      expect(await profiles()).toBe(0);
       expect(newWarnings()).toEqual([]);
     });
 
@@ -3174,9 +3130,17 @@ semantic_model:
           expect({label, binding, ...await pushResult(binding)})
               .toEqual({label, binding, code: 1, errors});
         }
+        // The report gives the model file's error under its own bindings.
         expect(await profiles()).toBe(1);
-        expect({label, report: rejects(profileSection('prod'))})
-            .toEqual({label, report: errors});
+        expect({
+          label,
+          prod: rejects(profileSection('prod')),
+          own: rejects(section(INLINE)),
+        }).toEqual({
+          label,
+          prod: errors.filter(e => e !== hinted),
+          own: errors.filter(e => e === hinted),
+        });
       }
     });
   });
