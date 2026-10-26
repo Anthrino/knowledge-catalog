@@ -1,4 +1,4 @@
-// Tests of what `kcmd profiles` prints for a scope that a plain push pushes in
+// Tests of what `kcmd profiles` prints for a scope whose plain push runs in
 // two phases (src/tool/commands.ts, profiles). Each case runs
 // `kcmd push --validate-only` and then the report.
 
@@ -151,9 +151,27 @@ scenarios('kcmd profiles reports what push rejects', [
     ['a malformed overview sidecar', {v2Aspects: true, files: {
        'commerce.overview.md': '---\ncontentType: markdown\n---\nOrders.\n',
      }}, "not 'markdown'", {'': [pushed()], 'no profiles': []}],
+    ['a model file that does not load beside a misnamed profile file', {files: {
+       'commerce.yaml': modelFile(MODEL)
+           .replace('    entities:\n', '    bogus_key: 1\n    entities:\n'),
+       'commerce.profile.prod.yaml': 'name: staging\n',
+     }}, 'bogus_key', {'': [pushed()]}],
+    ['a vanilla model file that does not load beside a GOOGLE block that ' +
+         'does not load', {files: {
+       'commerce.yaml': modelFile({google: {deployments: [graph('prod')]}})
+           .replace('    datasets:\n', "      - vendor_name: GOOGLE\n" +
+                    "        data: '[]'\n    datasets:\n")
+           .replace('        primary_key:', '        bogus_key: 1\n        primary_key:'),
+     }}, 'bogus_key', {'': [pushed()]}],
     ['a repeated metrics_exclude name the model lacks',
      {profiles: {prod: {...PROD, metrics_exclude: ['nope', 'nope']}}},
      "metric 'nope' in 'metrics_exclude'", {prod: [pushed()]}],
+    ['a metric a Spanner deployment\'s profile leaves available', {
+      deployments: [{name: 'sp', target: spannerGraph('g'), profile: 'prod'},
+                    graph('qa')],
+      metrics: [{name: 'n', expression: 'COUNT(customer.c_id)'}],
+      profiles: {prod: PROD},
+    }, "leaves metric(s) 'n' available", {prod: [pushed()]}],
   ] as Array<[string, Scope, string, ReportStep['rejects']]>).map(
       ([label, scope, part, rejects]): Case => ({
         name: `prints ${label} once`,

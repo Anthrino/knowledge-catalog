@@ -2895,8 +2895,9 @@ semantic_model:
         'must be a JSON object.');
   });
 
-  // Push reads the GOOGLE block before the load under every profile. Beside a
-  // third-party block that fails the load, the runtime names the same problem.
+  // A plain push of a model that lists no deployments reads the GOOGLE block
+  // before the load. Beside a third-party block that fails the load, the
+  // runtime names the same problem.
   test('a GOOGLE block that does not load stops the runtime with the error push gives', async () => {
     writeModel('{');
     const file = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg', 'commerce.yaml');
@@ -2916,9 +2917,9 @@ semantic_model:
     expect(messages(errorSpy)).toBe(`Error: Model document 'commerce': ${error}`);
   });
 
-  // The runtime reads every model's profiles before it applies one, as push
-  // does, so a later model's GOOGLE block is reported under a named profile
-  // too, whichever model comes first.
+  // The runtime reads every model's profiles before it applies one, as
+  // `kcmd push --profile <name>` does, so a later model's GOOGLE block is
+  // reported under a named profile too, whichever model comes first.
   test("the runtime reads every model's GOOGLE block before it applies a profile", async () => {
     for (const bad of ['alpha', 'beta']) {
       writeModel('{}');
@@ -3035,7 +3036,14 @@ semantic_model:
           "'commerce.yaml', which is a 0.2.0.dev0 document";
 
       await expect(push({validateOnly: true, profile: 'prod'})).rejects.toThrow(beside);
-      await expect(profiles()).rejects.toThrow(beside);
+      // A plain push loads the model file first, and so does the report.
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+      expect(await push({validateOnly: true})).toBe(1);
+      expect(messages(errorSpy)).toContain(problem);
+      expect(messages(errorSpy)).not.toContain(beside);
+      errorSpy.mockClear();
+      expect(await profiles()).toBe(1);
+      expect(messages(errorSpy)).toContain(problem);
     });
   }
 

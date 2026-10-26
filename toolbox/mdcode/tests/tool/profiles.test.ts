@@ -987,14 +987,19 @@ semantic_model:
       'commerce.yaml': PARTIES,
       'commerce.profile.prod.yaml': partiesProfile(true),
     });
-    expect(await pushResult('prod')).toEqual({code: 0, errors: []});
+    for (const binding of [undefined, 'prod']) {
+      expect({binding, ...await pushResult(binding)})
+          .toEqual({binding, code: 0, errors: []});
+    }
     expect(await profiles()).toBe(0);
     expect(profileSection('prod')).toContain('      customer -> bigquery.googleapis.com/projects/acme/datasets/prod/tables/customer');
     expect(errs).toEqual([]);
     writeScope({'commerce.profile.prod.yaml': partiesProfile(false)});
-    const {code, errors} = await pushResult('prod');
-    expect(code).toBe(1);
-    expect(errors.join('\n')).toContain(NOTES_INHERITED);
+    for (const binding of [undefined, 'prod']) {
+      const {code, errors} = await pushResult(binding);
+      expect({binding, code}).toEqual({binding, code: 1});
+      expect(errors.join('\n')).toContain(NOTES_INHERITED);
+    }
   });
 
   // The text merged from a legacy wrapper cannot say what the wrapper
@@ -1030,7 +1035,8 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
     }
   });
 
-  // Each scope makes `kcmd push --profile prod` fail. A new check push gains
+  // Each scope makes a push fail: a plain push when the scope has a sibling
+  // profile file, `kcmd push --profile prod` otherwise. A new check push gains
   // needs only a new row here.
   const rejected: Array<[string, Record<string, string>]> = [
     [
@@ -1093,13 +1099,11 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       'another model in the scope does not declare the profile',
       {
         'commerce.yaml': commerce(),
-        'commerce.profile.prod.yaml': profileFile('prod'),
+        'commerce.profiles/prod.yaml': legacyProfile(false),
         'shop.yaml': commerce().replace('name: commerce', 'name: shop'),
       },
     ],
   ];
-  // A plain push of a model with a sibling profile file runs in two phases,
-  // and the report gives its errors instead.
   for (const [label, files] of rejected) {
     test(`prints only push's errors when ${label}`, async () => {
       writeScope(files);
@@ -1108,7 +1112,15 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       expect(pushed.code).toBe(1);
       expect(pushed.errors).not.toEqual([]);
       expect(await profiles()).toBe(1);
-      expect(allRejects()).toEqual(pushed.errors);
+      // A second model adds push's one-model error above the models.
+      expect(allRejects()).toEqual([
+        ...(files['shop.yaml'] ?
+                [expect.stringContaining('would receive 2 models')] : []),
+        ...pushed.errors,
+      ]);
+      if (!twoPhase) {
+        expect(rejects(profileSection('prod'))).toEqual(pushed.errors);
+      }
     });
   }
 
@@ -1182,13 +1194,16 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
           'name: b\nrelationships:\n  - name: placed_by\n    to_columns: [c_email]\n',
     });
     const {errors} = await pushResult();
-    const own = (p: string) =>
-        errors.filter(e => e.startsWith(`[commerce.profile.${p}.yaml]`));
-    expect(own('a')).not.toEqual([]);
-    expect(own('b')).not.toEqual([]);
+    const [a, b] = ['a', 'b'].map(p => errors.filter(
+        e => e.startsWith(`[commerce.profile.${p}.yaml]`)));
+    expect(a).not.toEqual([]);
+    expect(b).not.toEqual([]);
     expect(await profiles()).toBe(1);
-    expect(rejects(profileSection('a'))).toEqual(own('a'));
-    expect(rejects(profileSection('b'))).toEqual(own('b'));
+    expect(rejects(profileSection('a'))).toEqual(a);
+    expect(rejects(profileSection('b'))).toEqual(b);
+    expect(rejects(logs, '  '))
+        .toEqual(errors.filter(e => !a.includes(e) && !b.includes(e)));
+    expect(allRejects().sort()).toEqual([...errors].sort());
   });
 
   // Push generates each graph's DDL offline, and a generator can fail. Its
@@ -1307,12 +1322,6 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
       '  - name: commerce\n',
       `  - name: commerce\n    custom_extensions:\n      - {vendor_name: DBT, ` +
           `data: ${'x'.repeat(130 * 1024)}}\n`);
-  // Customer's c_id field and 400 more, each reading its own column. A
-  // profile file restates them all, so each profile adds 401 expressions to
-  // customer's aspect.
-  const WIDE = `fields: [{ name: c_id, expression: c_id }, ${
-      Array.from({length: 400}, (_, i) => `{ name: f${i}, expression: col_${i} }`)
-          .join(', ')}]`;
   // Push gives a scope with two models its one-model error, once, and checks
   // neither the copies nor the aspects.
   for (const [label, model, v2] of [
@@ -1386,43 +1395,59 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
     });
   }
 
+  // Customer's c_id and 200 fields that each read a column with a long name.
+  // Each file that binds them all adds about 48 KB to customer's aspect.
+  const WIDE = `fields: [{ name: c_id, expression: c_id }, ${
+      Array.from({length: 200}, (_, i) => `{ name: f${i}, expression: c${
+          'x'.repeat(200)}${i} }`).join(', ')}]`;
+  // The model file and a profile file for each of `names`, each binding WIDE.
+  const wideScope = (...names: string[]) => ({
+    'commerce.yaml': commerce().replace(
+        'fields:\n          - { name: c_id, expression: c_id }', WIDE),
+    ...Object.fromEntries(names.map(p => [
+      `commerce.profile.${p}.yaml`,
+      profileFile(p).replace(/fields: \[\{ name: c_id.*/, WIDE),
+    ])),
+  });
   // With KC_V2_ASPECTS on, push reads the overview sidecars and checks every
   // aspect the catalog leg writes, before any graph deploys. A malformed
   // sidecar is reported once, for the scope. For a push in two phases, an
   // aspect too large belongs to the model.
-  for (const [label, files, error, profile, indent = '    '] of [
+  for (const [label, files, error, indent = '  '] of [
          ['an aspect over the size limit in a graph push',
           {'commerce.yaml': bigBlock(commerce({targets: 1}))},
-          'too large to store in Knowledge Catalog', undefined, '  '],
+          'too large to store in Knowledge Catalog'],
          ['an aspect over the size limit beside a profile file', {
            'commerce.yaml': bigBlock(commerce()),
            'commerce.profile.prod.yaml': profileFile('prod'),
-         }, 'too large to store in Knowledge Catalog', undefined, '  '],
-         ['an aspect only six profile files together make too large', {
-           'commerce.yaml': commerce().replace(
-               'fields:\n          - { name: c_id, expression: c_id }', WIDE),
-           ...Object.fromEntries(['a', 'b', 'c', 'd', 'e', 'f'].map(p => [
-             `commerce.profile.${p}.yaml`,
-             profileFile(p).replace(/fields: \[\{ name: c_id.*/, WIDE),
-           ])),
-         }, 'too large to store in Knowledge Catalog', undefined, '  '],
+         }, 'too large to store in Knowledge Catalog'],
+         ['an aspect only two profile files together make too large',
+          wideScope('a', 'b'), 'too large to store in Knowledge Catalog'],
          ['a malformed overview sidecar', {
            'commerce.yaml': commerce(),
            'commerce.overview.md':
                '---\ncontentType: markdown\n---\nOrders and customers.\n',
-         }, "not 'markdown'", undefined, ''],
-       ] as [string, Record<string, string>, string, string?, string?][]) {
+         }, "not 'markdown'", ''],
+       ] as [string, Record<string, string>, string, string?][]) {
     test(`prints push's error for ${label} with KC_V2_ASPECTS on`, async () => {
       process.env.KC_V2_ASPECTS = '1';
       writeScope(files);
-      const pushed = await pushResult(profile);
+      const pushed = await pushResult();
       expect(pushed).toEqual(
           {code: 1, errors: [expect.stringContaining(error)]});
       expect(await profiles()).toBe(1);
-      expect(rejects(profile ? profileSection(profile) : logs, indent))
-          .toEqual(pushed.errors);
+      expect(rejects(logs, indent)).toEqual(pushed.errors);
     });
   }
+
+  test('exits 0 for an aspect one profile file keeps under the size limit ' +
+           'with KC_V2_ASPECTS on',
+       async () => {
+         process.env.KC_V2_ASPECTS = '1';
+         writeScope(wideScope('a'));
+         expect(await pushResult()).toEqual({code: 0, errors: []});
+         expect(await profiles()).toBe(0);
+       });
 
   test('prints push\'s warnings for a custom ai_context member push leaves ' +
            'out and a sidecar that names no entry, with KC_V2_ASPECTS on',
@@ -1488,10 +1513,10 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
         .toHaveLength(1);
   });
 
-  // A graph push reads the profile files before anything else, so a profile
-  // file that breaks a layout rule throws before anything prints.
+  // When push stops at a profile file that breaks a layout rule, the report
+  // throws push's message before anything prints.
   for (const v2Aspects of [false, true]) {
-    test(`throws as push does for a profile file that breaks a layout rule${
+    test(`throws push's error for a profile file that breaks a layout rule${
              v2Aspects ? ' with KC_V2_ASPECTS on' : ''}`,
          async () => {
            if (v2Aspects) process.env.KC_V2_ASPECTS = '1';
@@ -1499,7 +1524,7 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
              'commerce.yaml': commerce(),
              'commerce.profile.prod.yaml': profileFile('other'),
            });
-           const pushed = await pushResult('prod');
+           const pushed = await pushResult();
            expect(pushed).toEqual({
              code: 1,
              errors: [expect.stringContaining("declares name 'other'")],
@@ -1726,7 +1751,7 @@ ${exclude ? '        fields_exclude: [notes]\n' : ''}`;
     // The model file's join columns do not stand in for a side a named
     // profile leaves out. A profile that states one side gets the
     // completeness error from a push of any binding, from `kcmd profiles`
-    // under each binding, and from the runtime.
+    // under the profile, and from the runtime.
     test('when a profile states one side of a join', async () => {
       const oneSide = (columns: string) => profileFile('staging').replace(
           /relationships:[\s\S]*/,
@@ -2061,9 +2086,8 @@ semantic_model:
         fs.rmSync(path.join(dir, 'catalog'), {recursive: true, force: true});
         writeScope(files);
         // A sibling profile file makes a plain push run in two phases.
-        await (Object.keys(files).some(f => f.includes('.profile.')) ?
-                   expectReport(pushes, label) :
-                   expectPushes(pushes, label));
+        const twoPhase = Object.keys(files).some(f => f.includes('.profile.'));
+        await (twoPhase ? expectReport : expectPushes)(pushes, label);
       }
     });
 
@@ -3030,9 +3054,9 @@ semantic_model:
     });
 
     // Push warns and still pushes when the model file's own bindings are
-    // incomplete and the model declares no deployment. `kcmd profiles` prints
-    // the warning under the default binding, unless it reports another profile.
-    test('warns about incomplete inline bindings when the model declares no deployment, on push and in the report', async () => {
+    // incomplete and no deployment uses them. `kcmd profiles` prints the
+    // warning under the default binding, unless it reports another profile.
+    test('warns about incomplete inline bindings that no deployment uses, on push and in the report', async () => {
       const warned: string[] = [];
       spyOn(console, 'warn').mockImplementation((m: any) => {
         warned.push(String(m));
@@ -3069,15 +3093,15 @@ semantic_model:
       expect(await profiles({profile: 'prod'})).toBe(0);
       expect(newWarnings()).toEqual([]);
 
-      // A deployment that names a profile gets no warning, in push or in the
-      // report.
+      // Push and the report still warn when every deployment names a profile.
       writeScope({
         'commerce.yaml': customerUnbound(commerce({targets: 1}))
             .replace(/(target: \S+)\n/, '$1\n        profile: prod\n'),
       });
       expect(await pushResult()).toEqual({code: 0, errors: []});
+      expect(newWarnings()).toEqual([`Warning: ${NO_DEFAULT}`]);
       expect(await profiles()).toBe(0);
-      expect(newWarnings()).toEqual([]);
+      expect(newWarnings()).toEqual(reported(NO_DEFAULT));
     });
 
     // A named profile that keeps the field unchanged gets no error of its
@@ -3132,15 +3156,10 @@ semantic_model:
         }
         // The report gives the model file's error under its own bindings.
         expect(await profiles()).toBe(1);
-        expect({
-          label,
-          prod: rejects(profileSection('prod')),
-          own: rejects(section(INLINE)),
-        }).toEqual({
-          label,
-          prod: errors.filter(e => e !== hinted),
-          own: errors.filter(e => e === hinted),
-        });
+        const inline = errors.filter(e => e === hinted);
+        expect({label, inline: rejects(section(INLINE)),
+                prod: rejects(profileSection('prod'))})
+            .toEqual({label, inline, prod: errors.filter(e => e !== hinted)});
       }
     });
   });
@@ -3347,8 +3366,7 @@ semantic_model:
   });
 
   // A model file whose own source is a Cloud SQL table is read in that table's
-  // dialect too: its ANSI_SQL metric is parsed as T-SQL, so its bracketed
-  // names resolve the metric's entity, which a BigQuery graph push needs.
+  // dialect too, so a field with only a BigQuery text fails the report.
   test('the inline bindings are read in the dialect its catalog entry gives', async () => {
     fs.writeFileSync(path.join(dir, 'catalog.yaml'), catalogYaml(undefined));
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
@@ -3364,16 +3382,12 @@ semantic_model:
         primary_key: [key]
         fields:
           - { name: key, expression: o_key }
-          - { name: amount, expression: {dialects: [{dialect: ANSI_SQL, expression: o_amount}]} }
-    metrics:
-      - name: revenue
-        expression:
-          dialects:
-            - { dialect: ANSI_SQL, expression: "SUM([Order].[amount])" }
+          - { name: amount, expression: {dialects: [{dialect: BIGQUERY, expression: o_amount}]} }
 `);
     stubCloudSqlEntry(200, 'cloudsql-sqlserver-table');
-    await profiles({});
-    expect(logs.join('\n')).not.toContain("metric 'revenue'");
+    expect(await profiles({})).toBe(1);
+    expect(logs.join('\n')).toContain(
+        "the model file binds entity 'Order' to a SQLSERVER source");
   });
 
   test('stops kcmd profiles and push when its entry cannot be read', async () => {
